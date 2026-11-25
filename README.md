@@ -1,4 +1,4 @@
-# SSH GUI
+# Pier
 
 MobaXterm 처럼 **SSH 터미널 + 옆의 파일 브라우저(SFTP)** 를 한 창에서 쓰는 맥용 데스크톱 앱.
 Tauri 2 (Rust) + xterm.js 로 만들어서 가볍고 빠릅니다.
@@ -50,6 +50,10 @@ src/                 프론트엔드 (TypeScript)
 src-tauri/src/
   ssh.rs             SSH/SFTP, 터미널, 키체인 등 백엔드 (russh)
 ```
+
+## 이름에 대해
+
+앱 이름은 **Pier** 예요. 이전 이름(`ssh-gui`)으로 저장된 데이터(접속 목록 폴더, 키체인 항목, 앱 식별자 `com.sshgui.app`)는 그대로 유지해서, 이름을 바꿔도 저장해 둔 접속과 비밀번호는 그대로 쓸 수 있어요.
 
 ## 보안 메모
 

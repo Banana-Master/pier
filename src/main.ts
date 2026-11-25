@@ -893,7 +893,7 @@ function openAlertSettings() {
   $("#x", m.box).onclick = m.close;
   $("#atest", m.box).onclick = async () => {
     const err = $("#aerr2", m.box);
-    const fail = await osNotify("SSH GUI 알림 테스트", "이 알림이 보이면 설정이 잘 된 거예요.");
+    const fail = await osNotify("Pier 알림 테스트", "이 알림이 보이면 설정이 잘 된 거예요.");
     const ok = fail === null;
     err.style.color = ok ? "var(--dim)" : "";
     // 맥이 알림을 받아도 화면 표시를 막는 경우(알림 스타일 “없음”)는 앱이 알 수 없어서, 안 보일 때 확인할 곳을 알려 준다
