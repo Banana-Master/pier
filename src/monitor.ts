@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { createAlertEngine, getAlertCfg } from "./alerts";
+import { parseMountLine, diskKind } from "./sysparse";
 
 const INTERVAL = 2000; // 조회 간격(ms)
 const HIST = 90; // 보관 샘플 수 (2초 × 90 = 3분)
@@ -172,14 +173,13 @@ export function startMonitor(sid: string, bar: HTMLElement, onAlert?: (title: st
 
       // 디스크: 물리 디스크 목록 + 마운트별 사용량
       const disks = pd.map((l) => Object.fromEntries([...l.matchAll(/(\w+)="([^"]*)"/g)].map((x) => [x[1], x[2]])));
-      const mounts = mnt.map((l) => { const p = l.split(/\s+/); return { dev: p[0], fs: p[1], total: Number(p[2]), used: Number(p[3]), pct: parseInt(p[5], 10), at: p.slice(6).join(" ") }; });
+      const mounts = mnt.map(parseMountLine).filter((x): x is NonNullable<typeof x> => x !== null);
       const root = mounts.find((x) => x.at === "/") ?? mounts[0];
       if (root) {
         diskPct = root.pct;
         set("disk", `${fmtKB(root.used)} / ${fmtKB(root.total)}${disks.length ? ` · 물리 ${disks.length}개` : ""}`, root.pct);
-        const kind = (d: Record<string, string>) => (d.TRAN === "nvme" || d.NAME?.startsWith("nvme") ? "NVMe SSD" : d.ROTA === "1" ? "HDD" : "SSD");
         const dHtml = disks.length
-          ? disks.map((d) => `<div class="dk"><b>/dev/${esc(d.NAME)}</b> <span>${fmtBytes(Number(d.SIZE))} · ${kind(d)}${d.TRAN && d.TRAN !== "nvme" ? " · " + esc(d.TRAN) : ""}</span><div class="md">${esc(d.MODEL.trim() || "모델 정보 없음")}</div></div>`).join("")
+          ? disks.map((d) => `<div class="dk"><b>/dev/${esc(d.NAME)}</b> <span>${fmtBytes(Number(d.SIZE))} · ${diskKind(d)}${d.TRAN && !["nvme", "usb"].includes(d.TRAN) ? " · " + esc(d.TRAN) : ""}</span><div class="md">${esc(d.MODEL.trim() || "모델 정보 없음")}</div></div>`).join("")
           : `<div class="md">물리 디스크 정보를 가져올 수 없어요 (가상 서버/컨테이너일 수 있음)</div>`;
         const mHtml = mounts.map((x) => `<div class="mt"><span>${esc(x.at)} <em>${esc(x.fs)}</em></span><i class="mini"><u style="width:${x.pct}%;background:${level(x.pct)}"></u></i><span>${fmtKB(x.used)} / ${fmtKB(x.total)} (${x.pct}%)</span></div>`).join("");
         graphs.disk = { title: `물리 디스크 ${disks.length}개 · 마운트 ${mounts.length}개`, lines: [], max: 100, fmt: String, html: `${dHtml}<div class="sep"></div>${mHtml}` };

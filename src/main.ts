@@ -896,8 +896,14 @@ function openAlertSettings() {
   const n = (id: string) => parseInt($<HTMLInputElement>("#" + id, m.box).value, 10);
   $("#x", m.box).onclick = m.close;
   $("#atest", m.box).onclick = async () => {
+    const err = $("#aerr2", m.box);
     const ok = await osNotify("SSH GUI 알림 테스트", "이 알림이 보이면 설정이 잘 된 거예요.");
-    $("#aerr2", m.box).textContent = ok ? "" : "맥 알림 권한이 없어요. 시스템 설정 → 알림에서 이 앱을 허용해 주세요.";
+    err.style.color = ok ? "var(--dim)" : "";
+    // 맥이 알림을 받아도 화면 표시를 막는 경우(알림 스타일 “없음”)는 앱이 알 수 없어서, 안 보일 때 확인할 곳을 알려 준다
+    err.textContent = !ok ? "알림을 보내지 못했어요. 시스템 설정 → 알림에서 확인하세요."
+      : import.meta.env.DEV
+        ? "알림을 보냈어요. 안 보이면: 개발 모드(tauri dev)에서는 알림이 “Terminal” 이름으로 가요. 시스템 설정 → 알림 → Terminal 에서 ‘알림 허용’을 켜고 스타일을 “배너”로 바꿔 주세요. (배포용 앱은 “SSH GUI” 이름으로 와요)"
+        : "알림을 보냈어요. 안 보이면: 시스템 설정 → 알림 → SSH GUI 에서 ‘알림 허용’을 켜고 스타일을 “배너”로 바꿔 주세요.";
   };
   $("#areset", m.box).onclick = () => {
     const d = DEFAULT_ALERTS;
