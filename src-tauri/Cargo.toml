@@ -1,6 +1,6 @@
 [package]
 name = "ssh-gui"
-version = "0.1.1"
+version = "0.1.2"
 description = "Pier — SSH terminal + SFTP file browser"
 authors = ["you"]
 edition = "2024"
