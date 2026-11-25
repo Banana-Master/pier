@@ -77,6 +77,18 @@ struct TermHandle {
     tx: mpsc::UnboundedSender<TermCmd>,
 }
 
+struct ExtHandle {
+    session_id: String,
+    task: tokio::task::JoinHandle<()>,
+    decide: mpsc::UnboundedSender<bool>,
+    dir: PathBuf,
+}
+
+struct TunnelHandle {
+    session_id: String,
+    task: tokio::task::JoinHandle<()>,
+}
+
 struct LocalPty {
     master: Box<dyn portable_pty::MasterPty + Send>,
     writer: Box<dyn std::io::Write + Send>,
@@ -85,7 +97,10 @@ struct LocalPty {
 
 #[derive(Default)]
 pub struct AppState {
-    sessions: Mutex<HashMap<String, Arc<SshSession>>>,
+    sessions: Arc<Mutex<HashMap<String, Arc<SshSession>>>>,
+    tunnels: Mutex<HashMap<String, TunnelHandle>>,
+    logs: Mutex<HashMap<String, mpsc::UnboundedSender<()>>>,
+    exts: Mutex<HashMap<String, ExtHandle>>,
     terms: Mutex<HashMap<String, TermHandle>>,
     locals: std::sync::Mutex<HashMap<String, LocalPty>>,
     next_id: AtomicU64,
@@ -247,6 +262,12 @@ pub async fn ssh_alive(state: State<'_, AppState>, session_id: String) -> R<bool
 
 #[tauri::command]
 pub async fn ssh_disconnect(state: State<'_, AppState>, session_id: String) -> R<()> {
+    state.tunnels.lock().await.retain(|_, t| {
+        if t.session_id == session_id { t.task.abort(); false } else { true }
+    });
+    state.exts.lock().await.retain(|_, e| {
+        if e.session_id == session_id { e.task.abort(); let _ = std::fs::remove_dir_all(&e.dir); false } else { true }
+    });
     {
         let mut terms = state.terms.lock().await;
         terms.retain(|_, t| {
@@ -668,6 +689,8 @@ pub struct Profile {
     group: String, // 폴더 이름 ("" = 미분류)
     #[serde(default)]
     jump: String, // ProxyJump (예: bastion 또는 user@host:22)
+    #[serde(default)]
+    tmux: bool, // 접속 시 tmux 세션에 자동 연결
 }
 
 fn profiles_path() -> R<PathBuf> {
@@ -1156,6 +1179,339 @@ pub fn ssh_config_hosts() -> R<Vec<SshHost>> {
     Ok(parse_ssh_config(&text))
 }
 
+// ───────────────────────── 로그 보기 (실시간) ─────────────────────────
+
+/// 로그 후보를 한 번에 모아서 돌려준다: 최근 수정된 /var/log 파일, 실행 중인 systemd 서비스, Docker 컨테이너
+#[tauri::command]
+pub async fn log_candidates(state: State<'_, AppState>, session_id: String) -> R<String> {
+    let s = state.session(&session_id).await?;
+    let script = r#"echo '##FILES'
+find /var/log -maxdepth 3 -type f -readable \( -name '*.log' -o -name 'syslog' -o -name 'messages' -o -name 'secure' \) -printf '%T@\t%s\t%p\n' 2>/dev/null | sort -rn | head -80
+echo '##UNITS'
+systemctl list-units --type=service --state=running --no-legend --plain 2>/dev/null | awk '{print $1}' | head -150
+echo '##DOCKER'
+command -v docker >/dev/null 2>&1 && docker ps -a --format '{{.Names}}\t{{.Status}}\t{{.Image}}' 2>/dev/null | head -100
+echo '##END'
+"#;
+    run_sh(&s, script, 15).await
+}
+
+#[derive(Serialize, Clone)]
+struct LogData {
+    id: String,
+    data: String, // base64
+}
+
+/// kind: "file" | "journal" | "docker". 끝없이 흘러나오는 로그를 "log-data" 이벤트로 보낸다.
+#[tauri::command]
+pub async fn log_start(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+    view_id: String,
+    kind: String,
+    target: String,
+) -> R<()> {
+    let name_ok = |t: &str, extra: &[char]| !t.is_empty() && t.len() <= 200 && t.chars().all(|c| c.is_ascii_alphanumeric() || extra.contains(&c));
+    let script = match kind.as_str() {
+        "file" => {
+            if !target.starts_with('/') || target.len() > 1024 { return Err("로그 파일은 /로 시작하는 전체 경로여야 해요".into()); }
+            format!("exec tail -n 300 -F -- {} 2>&1", sh_quote(&target))
+        }
+        "journal" => {
+            if !name_ok(&target, &['.', '_', '-', '@', ':']) { return Err("서비스 이름이 올바르지 않아요".into()); }
+            format!("exec journalctl -u {} -n 300 -f --no-pager -o short-iso 2>&1", sh_quote(&target))
+        }
+        "docker" => {
+            if !name_ok(&target, &['.', '_', '-']) { return Err("컨테이너 이름이 올바르지 않아요".into()); }
+            format!("exec docker logs --tail 300 -f --timestamps {} 2>&1", sh_quote(&target))
+        }
+        _ => return Err("지원하지 않는 로그 종류예요".into()),
+    };
+    let s = state.session(&session_id).await?;
+    let (a1, a2, vid1, vid2) = (app.clone(), app.clone(), view_id.clone(), view_id.clone());
+    let tx = spawn_log(
+        &s,
+        &script,
+        Arc::new(move |d: &[u8]| { let _ = a1.emit("log-data", LogData { id: vid1.clone(), data: B64.encode(d) }); }),
+        Arc::new(move || { let _ = a2.emit("log-end", vid2.clone()); }),
+    )
+    .await?;
+    state.logs.lock().await.insert(view_id, tx);
+    Ok(())
+}
+
+/// 원격에서 `script` 를 pty 로 실행하고 출력을 계속 on_data 로 보낸다. 반환된 sender 로 신호를 보내면 중지.
+/// pty 를 쓰는 이유: 채널을 닫을 때 서버의 tail/journalctl 도 SIGHUP 으로 바로 끝나게 하려는 것.
+async fn spawn_log(
+    s: &SshSession,
+    script: &str,
+    on_data: Arc<dyn Fn(&[u8]) + Send + Sync>,
+    on_end: Arc<dyn Fn() + Send + Sync>,
+) -> R<mpsc::UnboundedSender<()>> {
+    let mut ch = s.handle.channel_open_session().await.map_err(e2s)?;
+    ch.request_pty(false, "dumb", 220, 50, 0, 0, &[]).await.map_err(e2s)?;
+    ch.exec(true, format!("sh -c {}", sh_quote(script))).await.map_err(e2s)?;
+    let (tx, mut rx) = mpsc::unbounded_channel::<()>();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = rx.recv() => { let _ = ch.close().await; break; }
+                msg = ch.wait() => match msg {
+                    Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => on_data(&data[..]),
+                    Some(ChannelMsg::Close) | None => break,
+                    _ => {}
+                },
+            }
+        }
+        on_end();
+    });
+    Ok(tx)
+}
+
+#[tauri::command]
+pub async fn log_stop(state: State<'_, AppState>, view_id: String) -> R<()> {
+    if let Some(tx) = state.logs.lock().await.remove(&view_id) {
+        let _ = tx.send(());
+    }
+    Ok(())
+}
+
+// ───────────────────────── Docker ─────────────────────────
+
+#[tauri::command]
+pub async fn docker_list(state: State<'_, AppState>, session_id: String) -> R<String> {
+    let s = state.session(&session_id).await?;
+    let script = r#"command -v docker >/dev/null 2>&1 || { echo '##NODOCKER'; exit 0; }
+docker ps -a --format '{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.State}}\t{{.Status}}\t{{.Ports}}' 2>&1
+echo '##STATS'
+docker stats --no-stream --format '{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}' 2>&1
+"#;
+    run_sh(&s, script, 25).await
+}
+
+#[tauri::command]
+pub async fn docker_action(state: State<'_, AppState>, session_id: String, name: String, action: String) -> R<String> {
+    if !matches!(action.as_str(), "start" | "stop" | "restart") {
+        return Err("지원하지 않는 동작이에요".into());
+    }
+    if name.is_empty() || name.len() > 200 || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-') {
+        return Err("컨테이너 이름이 올바르지 않아요".into());
+    }
+    let s = state.session(&session_id).await?;
+    script_ok(run_sh(&s, &format!("docker {action} {} 2>&1 && echo __OK__\n", sh_quote(&name)), 90).await?)
+}
+
+// ───────────────────────── 외부 에디터로 열기 (저장하면 서버에 자동 반영) ─────────────────────────
+
+#[derive(Clone, Debug, PartialEq)]
+enum ExtEvent {
+    Saved,
+    Conflict,
+    Error(String),
+}
+
+#[derive(Serialize, Clone)]
+struct ExtEv {
+    id: String,
+    name: String,
+    kind: &'static str, // saved | conflict | error
+    message: String,
+}
+
+async fn remote_stat(sess: &SshSession, path: &str) -> Option<(u64, u64)> {
+    let md = sess.sftp.metadata(path).await.ok()?;
+    Some((md.len(), md.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_secs()))
+}
+
+async fn download_to(sftp: &SftpSession, remote: &str, local: &Path) -> anyhow::Result<()> {
+    let mut r = sftp.open(remote).await?;
+    let mut f = tokio::fs::File::create(local).await?;
+    tokio::io::copy(&mut r, &mut f).await?;
+    f.flush().await?;
+    Ok(())
+}
+
+async fn upload_file(sftp: &SftpSession, local: &Path, remote: &str) -> anyhow::Result<()> {
+    let mut f = tokio::fs::File::open(local).await?;
+    let mut w = sftp.create(remote).await?;
+    tokio::io::copy(&mut f, &mut w).await?;
+    w.flush().await?;
+    w.shutdown().await?;
+    Ok(())
+}
+
+/// 로컬 파일이 저장될 때마다 서버로 올린다. 내가 연 뒤에 서버 쪽이 바뀌었으면 덮어쓰기 전에 Conflict 를 알리고
+/// `decide` 로 답(true=덮어쓰기, false=이번엔 건너뛰기)이 올 때까지 기다린다.
+fn spawn_ext_watch(
+    sessions: Sessions,
+    sid: String,
+    remote: String,
+    local: PathBuf,
+    baseline: Option<(u64, u64)>,
+    interval: Duration,
+    on_event: Arc<dyn Fn(ExtEvent) + Send + Sync>,
+    mut decide: mpsc::UnboundedReceiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mtime = |p: PathBuf| async move { tokio::fs::metadata(p).await.ok().and_then(|m| m.modified().ok()) };
+        let mut base = baseline;
+        let mut last = mtime(local.clone()).await;
+        loop {
+            tokio::time::sleep(interval).await;
+            let Some(mt) = mtime(local.clone()).await else { continue };
+            if Some(mt) == last {
+                continue;
+            }
+            // 에디터가 아직 쓰는 중일 수 있으니 한 번 더 기다렸다가 값이 안정되면 올린다
+            tokio::time::sleep(interval / 2).await;
+            if mtime(local.clone()).await != Some(mt) {
+                continue;
+            }
+            last = Some(mt);
+            let Some(sess) = sessions.lock().await.get(&sid).cloned() else {
+                on_event(ExtEvent::Error("서버와 연결이 끊겨 있어요".into()));
+                continue;
+            };
+            if let (Some(b), Some(c)) = (base, remote_stat(&sess, &remote).await) {
+                if b != c {
+                    on_event(ExtEvent::Conflict);
+                    match decide.recv().await {
+                        Some(true) => {}
+                        Some(false) => continue,
+                        None => return,
+                    }
+                }
+            }
+            match upload_file(&sess.sftp, &local, &remote).await {
+                Ok(()) => {
+                    base = remote_stat(&sess, &remote).await;
+                    on_event(ExtEvent::Saved);
+                }
+                Err(e) => on_event(ExtEvent::Error(e.to_string())),
+            }
+        }
+    })
+}
+
+fn ext_cache_root() -> Option<PathBuf> {
+    dirs::cache_dir().map(|d| d.join("ssh-gui").join("ext"))
+}
+
+/// 앱 시작 때 지난 실행에서 남은 외부 편집 임시 파일을 지운다 (감시는 재시작하면 이어지지 않으므로)
+pub fn cleanup_ext_cache() {
+    if let Some(r) = ext_cache_root() {
+        let _ = std::fs::remove_dir_all(r);
+    }
+}
+
+/// 설치돼 있는 외부 에디터 후보 목록
+#[tauri::command]
+pub fn ext_apps() -> Vec<String> {
+    let known = ["Visual Studio Code", "Cursor", "Zed", "Sublime Text", "Nova", "BBEdit", "TextMate", "IntelliJ IDEA", "PyCharm", "WebStorm", "TextEdit"];
+    let mut roots = vec![PathBuf::from("/Applications"), PathBuf::from("/System/Applications")];
+    if let Some(h) = dirs::home_dir() {
+        roots.push(h.join("Applications"));
+    }
+    known
+        .iter()
+        .filter(|n| roots.iter().any(|r| r.join(format!("{n}.app")).exists()))
+        .map(|n| n.to_string())
+        .collect()
+}
+
+/// 서버 파일을 임시 폴더로 내려받아 외부 에디터로 열고, 저장될 때마다 서버에 올린다.
+/// `app_name` 이 비어 있으면 시스템 기본 앱으로 연다.
+#[tauri::command]
+pub async fn ext_open(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+    remote_path: String,
+    app_name: String,
+) -> R<String> {
+    if !app_name.chars().all(|c| c.is_alphanumeric() || c == ' ' || c == '.' || c == '-' || c == '_' || c == '+') {
+        return Err("에디터 이름이 올바르지 않아요".into());
+    }
+    let s = state.session(&session_id).await?;
+    let md = s.sftp.metadata(remote_path.as_str()).await.map_err(e2s)?;
+    if md.is_dir() {
+        return Err("폴더는 외부 에디터로 열 수 없어요".into());
+    }
+    if md.len() > 200 * 1024 * 1024 {
+        return Err("파일이 너무 커요 (최대 200 MB)".into());
+    }
+    let id = state.new_id("x");
+    let dir = ext_cache_root().ok_or("캐시 폴더를 찾지 못했어요")?.join(&id);
+    std::fs::create_dir_all(&dir).map_err(e2s)?;
+    let name = remote_path.rsplit('/').next().unwrap_or("file").to_string();
+    let local = dir.join(&name);
+    download_to(&s.sftp, &remote_path, &local).await.map_err(e2s)?;
+    let baseline = remote_stat(&s, &remote_path).await;
+
+    let (dtx, drx) = mpsc::unbounded_channel::<bool>();
+    let (app2, id2, name2) = (app.clone(), id.clone(), name.clone());
+    let on_event: Arc<dyn Fn(ExtEvent) + Send + Sync> = Arc::new(move |ev| {
+        let (kind, message) = match ev {
+            ExtEvent::Saved => ("saved", String::new()),
+            ExtEvent::Conflict => ("conflict", String::new()),
+            ExtEvent::Error(m) => ("error", m),
+        };
+        let _ = app2.emit("ext-event", ExtEv { id: id2.clone(), name: name2.clone(), kind, message });
+    });
+    let task = spawn_ext_watch(state.sessions.clone(), session_id.clone(), remote_path, local.clone(), baseline, Duration::from_millis(700), on_event, drx);
+    state.exts.lock().await.insert(id.clone(), ExtHandle { session_id, task, decide: dtx, dir });
+
+    let mut cmd = std::process::Command::new("open");
+    if !app_name.is_empty() {
+        cmd.arg("-a").arg(&app_name);
+    }
+    cmd.arg(&local);
+    let status = cmd.status().map_err(e2s)?;
+    if !status.success() {
+        return Err(format!("“{}” 으로 열지 못했어요. 에디터 이름을 확인하세요", if app_name.is_empty() { "기본 앱" } else { &app_name }));
+    }
+    Ok(id)
+}
+
+#[tauri::command]
+pub async fn ext_resolve(state: State<'_, AppState>, id: String, overwrite: bool) -> R<()> {
+    if let Some(e) = state.exts.lock().await.get(&id) {
+        let _ = e.decide.send(overwrite);
+    }
+    Ok(())
+}
+
+// ───────────────────────── 맥 알림 ─────────────────────────
+
+/// 맥 알림을 보낸다.
+///
+/// 맥에서는 `osascript` 로 보낸다. 알림 플러그인은 개발 모드(`tauri dev`)에서 "Terminal" 인 척하고 보내는데, 이 방식은
+/// 맥이 거부하기도 해서(로그: Denying message from com.apple.Terminal) 알림이 조용히 사라진다. osascript 는 시스템
+/// 앱(Script Editor) 이름으로 확실히 전달된다. 제목/내용은 AppleScript 인자로 넘겨서 따옴표가 있어도 안전하다.
+#[tauri::command]
+pub fn notify_os(app: AppHandle, title: String, body: String) -> R<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = &app;
+        let out = std::process::Command::new("osascript")
+            .args(["-e", "on run argv", "-e", "display notification (item 2 of argv) with title (item 1 of argv)", "-e", "end run"])
+            .arg(&title)
+            .arg(&body)
+            .output()
+            .map_err(e2s)?;
+        if out.status.success() {
+            return Ok(());
+        }
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        use tauri_plugin_notification::NotificationExt;
+        app.notification().builder().title(title).body(body).show().map_err(e2s)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1199,4 +1555,634 @@ Match host foo
         assert_eq!(w.proxy_jump, "bastion");
         assert_eq!(w.identity_file, "~/.ssh/web_key"); // 자기 설정이 기본값보다 우선
     }
+
+    /// 압축 스크립트를 이 맥의 sh 로 실행해서 결과(__OK__ 여부, 출력)를 돌려준다
+    fn run_local(script: &str) -> (bool, String) {
+        let mut child = std::process::Command::new("sh").arg("-s")
+            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+        use std::io::Write as _;
+        child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+        let o = child.wait_with_output().unwrap();
+        let text = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        (text.contains("__OK__"), text)
+    }
+
+    #[test]
+    fn archive_keeps_or_deletes_originals_safely() {
+        let tmp = std::env::temp_dir().join(format!("sshgui-arch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let work = tmp.join("work dir");
+        std::fs::create_dir_all(work.join("sub")).unwrap();
+        std::fs::create_dir_all(tmp.join("out")).unwrap();
+        std::fs::write(work.join("a b.txt"), "data").unwrap();
+        std::fs::write(work.join("sub/c.txt"), "c").unwrap();
+        let cwd = work.to_string_lossy().to_string();
+        let names = vec!["a b.txt".to_string(), "sub".to_string()];
+
+        // 기본: 원본 유지, 현재 폴더에 생성
+        let sc = archive_script(&cwd, &names, "k.tar.gz", "", "tgz", false).unwrap();
+        assert!(run_local(&sc).0);
+        assert!(work.join("k.tar.gz").exists() && work.join("a b.txt").exists() && work.join("sub/c.txt").exists());
+
+        // 같은 이름이 있으면 거부(덮어쓰지 않음)
+        assert!(!run_local(&sc).0);
+
+        // 다른 폴더에 저장 + 원본 삭제: 압축본이 만들어지고 검증된 뒤에만 원본이 사라져야 함
+        let outd = tmp.join("out").to_string_lossy().to_string();
+        let sc = archive_script(&cwd, &names, "m.tar.gz", &outd, "tgz", true).unwrap();
+        let (ok, text) = run_local(&sc);
+        assert!(ok, "{text}");
+        assert!(tmp.join("out/m.tar.gz").exists(), "지정한 위치에 만들어져야 함");
+        assert!(!work.join("a b.txt").exists() && !work.join("sub").exists(), "원본은 삭제돼야 함");
+        assert!(work.join("k.tar.gz").exists(), "대상이 아닌 파일은 그대로");
+        // 압축본 안에 내용이 실제로 들어 있는지
+        let ls = std::process::Command::new("tar").args(["-tzf"]).arg(tmp.join("out/m.tar.gz")).output().unwrap();
+        let listing = String::from_utf8_lossy(&ls.stdout).to_string();
+        assert!(listing.contains("a b.txt") && listing.contains("sub/c.txt"), "{listing}");
+
+        // 압축 도중 실패하면 원본을 절대 지우지 않음 (대상이 없는 이름)
+        std::fs::write(work.join("keep.txt"), "keep").unwrap();
+        let sc = archive_script(&cwd, &["keep.txt".to_string(), "missing.txt".to_string()], "bad.tar.gz", "", "tgz", true).unwrap();
+        let (ok, _) = run_local(&sc);
+        assert!(!ok);
+        assert!(work.join("keep.txt").exists(), "실패 시 원본은 그대로여야 함");
+        assert!(!work.join("bad.tar.gz").exists(), "실패한 압축 파일은 남기지 않아야 함");
+
+        // 위험한 입력은 스크립트 생성 단계에서 거부
+        assert!(archive_script(&cwd, &["..".to_string()], "x.tar.gz", "", "tgz", true).is_err());
+        assert!(archive_script(&cwd, &[".".to_string()], "x.tar.gz", "", "tgz", true).is_err());
+        assert!(archive_script(&cwd, &["a/b".to_string()], "x.tar.gz", "", "tgz", false).is_err());
+        assert!(archive_script(&cwd, &["x".to_string()], "../x.tar.gz", "", "tgz", false).is_err());
+        assert!(archive_script("/", &["etc".to_string()], "x.tar.gz", "", "tgz", true).is_err(), "루트에서 원본 삭제 금지");
+        let inside = format!("{cwd}/sub/inner");
+        assert!(archive_script(&cwd, &["sub".to_string()], "x.tar.gz", &inside, "tgz", false).is_err(), "압축 대상 폴더 안에는 저장 금지");
+        assert!(archive_script("relative", &["x".to_string()], "x.tar.gz", "", "tgz", false).is_err());
+        // 이름에 따옴표/공백/셸 특수문자가 있어도 안전
+        std::fs::write(work.join("it's $(x); y.txt"), "q").unwrap();
+        let sc = archive_script(&cwd, &["it's $(x); y.txt".to_string()], "q.tar.gz", "", "tgz", true).unwrap();
+        assert!(run_local(&sc).0);
+        assert!(!work.join("it's $(x); y.txt").exists() && work.join("q.tar.gz").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // HOME 환경변수를 바꾸는 테스트끼리 동시에 돌지 않게 한다
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn generated_key_is_valid_openssh() {
+        let _g = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("sshgui-test-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        unsafe { std::env::set_var("HOME", &tmp) }; // 테스트 전용: 실제 ~/.ssh 를 건드리지 않게
+
+        // 패스프레이즈 없는 키
+        let k = key_generate("t1".into(), "".into()).unwrap();
+        assert!(k.public.starts_with("ssh-ed25519 "), "{}", k.public);
+        let path = tmp.join(".ssh/ssh-gui_t1");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        // ssh-keygen 이 개인키에서 같은 공개키를 뽑아내야 한다
+        let out = std::process::Command::new("ssh-keygen").args(["-y", "-f"]).arg(&path).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let derived = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(derived.split_whitespace().take(2).collect::<Vec<_>>(), k.public.split_whitespace().take(2).collect::<Vec<_>>());
+        // 같은 이름 재생성은 거부
+        assert!(key_generate("t1".into(), "".into()).is_err());
+
+        // 패스프레이즈 있는 키: 맞는 패스프레이즈로만 열려야 한다
+        key_generate("t2".into(), "s3cret-pass".into()).unwrap();
+        let p2 = tmp.join(".ssh/ssh-gui_t2");
+        assert!(russh::keys::load_secret_key(&p2, None).is_err());
+        assert!(russh::keys::load_secret_key(&p2, Some("wrong")).is_err());
+        assert!(russh::keys::load_secret_key(&p2, Some("s3cret-pass")).is_ok());
+        let out = std::process::Command::new("ssh-keygen").args(["-y", "-P", "s3cret-pass", "-f"]).arg(&p2).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+        // 잘못된 이름 거부
+        assert!(key_generate("../evil".into(), "".into()).is_err());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    struct Sshd(std::process::Child);
+    impl Drop for Sshd {
+        fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+    }
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    /// 127.0.0.1 에만 열리는 일회용 sshd (임시 호스트키, 공개키 인증만)
+    fn start_sshd(dir: &std::path::Path, port: u16, authorized: &std::path::Path) -> Sshd {
+        let hk = dir.join("host_key");
+        assert!(std::process::Command::new("ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&hk).status().unwrap().success());
+        let conf = dir.join("sshd_config");
+        std::fs::write(&conf, format!(
+            "Port {port}\nListenAddress 127.0.0.1\nHostKey {}\nAuthorizedKeysFile {}\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nPubkeyAuthentication yes\nUsePAM no\nStrictModes no\nPidFile {}\nLogLevel ERROR\nAllowTcpForwarding yes\nSubsystem sftp /usr/libexec/sftp-server\n",
+            hk.display(), authorized.display(), dir.join("sshd.pid").display()
+        )).unwrap();
+        let child = std::process::Command::new("/usr/sbin/sshd").args(["-D", "-e", "-f"]).arg(&conf)
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().expect("sshd 실행 실패");
+        for _ in 0..50 {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() { return Sshd(child); }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!("sshd 가 시작되지 않았어요");
+    }
+
+    #[tokio::test]
+    async fn real_sshd_end_to_end() {
+        let _g = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("sshgui-e2e-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        unsafe { std::env::set_var("HOME", &tmp) }; // known_hosts 등이 실제 ~/.ssh 에 쓰이지 않게
+
+        let k = key_generate("e2e".into(), "".into()).unwrap();
+        let authorized = tmp.join("authorized_keys");
+        std::fs::write(&authorized, format!("{}\n", k.public)).unwrap();
+        let port = free_port();
+        let _sshd = start_sshd(&tmp, port, &authorized);
+        let user = std::env::var("USER").unwrap_or_else(|_| String::from_utf8_lossy(&std::process::Command::new("id").arg("-un").output().unwrap().stdout).trim().to_string());
+
+        let args = |jump: Option<Box<ConnectArgs>>, key: &str| ConnectArgs {
+            host: "127.0.0.1".into(), port, username: user.clone(),
+            auth: Auth::Key { path: key.into(), passphrase: None }, jump,
+        };
+
+        // 1) 키 인증 + 호스트 키 TOFU(처음엔 등록, 두 번째는 일치 확인)
+        let sess = establish(args(None, &k.path)).await.expect("키 로그인 실패");
+        let sess2 = establish(args(None, &k.path)).await.expect("두 번째 로그인(known_hosts 일치 확인) 실패");
+        drop(sess2);
+        // 틀린 키는 거부되어야 함
+        let bad = key_generate("bad".into(), "".into()).unwrap();
+        assert!(establish(args(None, &bad.path)).await.is_err(), "등록 안 된 키로 로그인되면 안 됨");
+
+        // 2) 원격 명령 실행 (run_sh)
+        let out = run_sh(&sess, "echo hello-$((1+2))\n", 10).await.unwrap();
+        assert_eq!(out.trim(), "hello-3");
+        // 3) 권한 변경/압축 스크립트를 원격에서 실제로 실행
+        let work = tmp.join("work dir");
+        std::fs::create_dir_all(work.join("sub")).unwrap();
+        std::fs::write(work.join("a b.txt"), "data").unwrap();
+        let wq = sh_quote(&work.to_string_lossy());
+        let o = run_sh(&sess, &format!("cd {wq} && {{ tar -czf 'x.tar.gz' -- 'a b.txt' 'sub'; }} 2>&1 && echo __OK__\n"), 20).await.unwrap();
+        assert!(script_ok(o).is_ok());
+        assert!(work.join("x.tar.gz").exists());
+        let o = run_sh(&sess, &format!("{{ chmod -R 700 {wq}/sub {wq}/'a b.txt'; }} 2>&1 && echo __OK__\n"), 20).await.unwrap();
+        assert!(script_ok(o).is_ok());
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(work.join("a b.txt")).unwrap().permissions().mode() & 0o777, 0o700);
+
+        // 4) SFTP: 쓰고, 읽고, 목록
+        sess.sftp.write(format!("{}/via-sftp.txt", work.display()), b"sftp-ok").await.unwrap();
+        assert_eq!(sess.sftp.read(format!("{}/via-sftp.txt", work.display())).await.unwrap(), b"sftp-ok");
+        let names: Vec<String> = sess.sftp.read_dir(work.to_string_lossy().to_string()).await.unwrap().map(|e| e.file_name().to_string()).collect();
+        assert!(names.contains(&"a b.txt".to_string()) && names.contains(&"via-sftp.txt".to_string()), "{names:?}");
+
+        // 5) 터널링: 내 맥 포트 → (SSH) → 에코 서버
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut c, _)) = echo.accept().await else { break };
+                tokio::spawn(async move {
+                    let (mut r, mut w) = c.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+        let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+        sessions.lock().await.insert("s1".into(), Arc::new(sess));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tport = listener.local_addr().unwrap().port();
+        let errs = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let e2 = errs.clone();
+        let task = spawn_tunnel(sessions.clone(), "s1".into(), listener, "127.0.0.1".into(), echo_port, Arc::new(move |m| e2.lock().unwrap().push(m)));
+        let mut c = tokio::net::TcpStream::connect(("127.0.0.1", tport)).await.unwrap();
+        c.write_all(b"ping-through-tunnel").await.unwrap();
+        let mut buf = vec![0u8; 19];
+        tokio::time::timeout(Duration::from_secs(5), c.read_exact(&mut buf)).await.expect("터널 응답 시간 초과").unwrap();
+        assert_eq!(&buf, b"ping-through-tunnel");
+        // 연결 거부되는 서버쪽 포트 → 에러 콜백
+        let dead = free_port();
+        let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let p2 = l2.local_addr().unwrap().port();
+        let e3 = errs.clone();
+        let task2 = spawn_tunnel(sessions.clone(), "s1".into(), l2, "127.0.0.1".into(), dead, Arc::new(move |m| e3.lock().unwrap().push(m)));
+        let _ = tokio::net::TcpStream::connect(("127.0.0.1", p2)).await.unwrap();
+        for _ in 0..30 { if !errs.lock().unwrap().is_empty() { break; } tokio::time::sleep(Duration::from_millis(100)).await; }
+        assert!(!errs.lock().unwrap().is_empty(), "연결 거부 시 오류가 보고되어야 함");
+        task.abort(); task2.abort();
+
+        // 6) 점프 호스트: 같은 sshd 를 경유해서 다시 접속 (ProxyJump)
+        let via = establish(args(Some(Box::new(args(None, &k.path))), &k.path)).await.expect("점프 호스트 경유 접속 실패");
+        assert_eq!(run_sh(&via, "echo via-jump\n", 10).await.unwrap().trim(), "via-jump");
+
+        // 7) 실시간 로그: tail -F 로 새 줄이 흘러오는지, 중지하면 서버의 tail 이 끝나는지
+        let logf = tmp.join("app.log");
+        std::fs::write(&logf, "line-1\nline-2\n").unwrap();
+        let got = Arc::new(std::sync::Mutex::new(String::new()));
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (g2, e2) = (got.clone(), ended.clone());
+        let stop = spawn_log(
+            &via,
+            &format!("exec tail -n 300 -F -- {} 2>&1", sh_quote(&logf.to_string_lossy())),
+            Arc::new(move |d: &[u8]| g2.lock().unwrap().push_str(&String::from_utf8_lossy(d))),
+            Arc::new(move || e2.store(true, std::sync::atomic::Ordering::SeqCst)),
+        ).await.unwrap();
+        let wait_for = |needle: &'static str| {
+            let got = got.clone();
+            async move {
+                for _ in 0..50 { if got.lock().unwrap().contains(needle) { return true; } tokio::time::sleep(Duration::from_millis(100)).await; }
+                false
+            }
+        };
+        assert!(wait_for("line-2").await, "기존 로그 줄이 와야 함: {:?}", got.lock().unwrap());
+        use std::io::Write as _;
+        std::fs::OpenOptions::new().append(true).open(&logf).unwrap().write_all(b"NEW-LINE-ERROR\n").unwrap();
+        assert!(wait_for("NEW-LINE-ERROR").await, "실시간으로 추가된 줄이 와야 함: {:?}", got.lock().unwrap());
+        let tail_pat = format!("tail -n 300 -F -- {}", logf.display());
+        let alive = || std::process::Command::new("pgrep").args(["-f", &tail_pat]).output().map(|o| o.status.success()).unwrap_or(false);
+        assert!(alive(), "스트리밍 중에는 서버에 tail 프로세스가 있어야 함");
+        stop.send(()).unwrap();
+        for _ in 0..50 { if ended.load(std::sync::atomic::Ordering::SeqCst) && !alive() { break; } tokio::time::sleep(Duration::from_millis(100)).await; }
+        assert!(ended.load(std::sync::atomic::Ordering::SeqCst), "중지하면 종료 콜백이 불려야 함");
+        assert!(!alive(), "중지하면 서버의 tail 프로세스도 끝나야 함 (좀비 방지)");
+
+        // 8) 외부 에디터 동기화: 로컬 저장 → 서버 반영, 서버가 바뀌었으면 충돌 확인
+        let remote = tmp.join("ext-remote.txt");
+        std::fs::write(&remote, "v1").unwrap();
+        let local = tmp.join("ext-local.txt");
+        let (rs, rl) = (remote.to_string_lossy().to_string(), local.clone());
+        let sess1 = sessions.lock().await.get("s1").cloned().unwrap();
+        download_to(&sess1.sftp, &rs, &rl).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&local).unwrap(), "v1");
+        let events = Arc::new(std::sync::Mutex::new(Vec::<ExtEvent>::new()));
+        let ev2 = events.clone();
+        let (dtx, drx) = mpsc::unbounded_channel::<bool>();
+        let baseline = remote_stat(&sess1, &rs).await;
+        let watch = spawn_ext_watch(sessions.clone(), "s1".into(), rs.clone(), rl.clone(), baseline, Duration::from_millis(100), Arc::new(move |e| ev2.lock().unwrap().push(e)), drx);
+        let wait_ev = |n: usize| {
+            let events = events.clone();
+            async move { for _ in 0..80 { if events.lock().unwrap().len() >= n { return true; } tokio::time::sleep(Duration::from_millis(100)).await; } false }
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        std::fs::write(&local, "v2").unwrap();                       // 에디터에서 저장
+        assert!(wait_ev(1).await, "저장 이벤트가 와야 함");
+        assert_eq!(events.lock().unwrap()[0], ExtEvent::Saved);
+        assert_eq!(std::fs::read_to_string(&remote).unwrap(), "v2", "서버에 반영돼야 함");
+
+        tokio::time::sleep(Duration::from_millis(1100)).await;       // 서버 쪽 mtime(초 단위)이 달라지도록
+        std::fs::write(&remote, "changed-on-server").unwrap();       // 다른 사람이 서버에서 수정
+        std::fs::write(&local, "v3-local").unwrap();
+        assert!(wait_ev(2).await, "충돌 이벤트가 와야 함");
+        assert_eq!(events.lock().unwrap()[1], ExtEvent::Conflict);
+        dtx.send(false).unwrap();                                    // 이번엔 건너뛰기
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(std::fs::read_to_string(&remote).unwrap(), "changed-on-server", "건너뛰면 서버 내용이 그대로여야 함");
+        assert_eq!(events.lock().unwrap().len(), 2, "건너뛴 뒤 추가 이벤트가 없어야 함");
+
+        std::fs::write(&local, "v4-local").unwrap();                 // 다시 저장 → 충돌 → 덮어쓰기
+        assert!(wait_ev(3).await);
+        assert_eq!(events.lock().unwrap()[2], ExtEvent::Conflict);
+        dtx.send(true).unwrap();
+        assert!(wait_ev(4).await, "덮어쓰기 후 저장 이벤트가 와야 함");
+        assert_eq!(events.lock().unwrap()[3], ExtEvent::Saved);
+        assert_eq!(std::fs::read_to_string(&remote).unwrap(), "v4-local");
+        watch.abort();
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
+// ───────────────────────── tmux ─────────────────────────
+
+fn valid_name(n: &str) -> bool {
+    !n.is_empty() && n.len() <= 64 && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// tmux 세션 안에서 현재 보고 있는 칸의 작업 폴더 (파일 패널 "경로 따라가기"용).
+/// tmux 안에서는 셸의 OSC 7 경로 알림이 바깥으로 전달되지 않아 직접 물어본다.
+#[tauri::command]
+pub async fn tmux_cwd(state: State<'_, AppState>, session_id: String, name: String) -> R<String> {
+    if !valid_name(&name) {
+        return Err("잘못된 tmux 세션 이름".into());
+    }
+    let s = state.session(&session_id).await?;
+    let out = run_sh(&s, &format!("tmux display-message -p -t {} '#{{pane_current_path}}' 2>/dev/null\n", sh_quote(&name)), 5).await?;
+    Ok(out.trim().to_string())
+}
+
+// ───────────────────────── 권한 변경 / 압축 / 압축 풀기 ─────────────────────────
+
+fn script_ok(out: String) -> R<String> {
+    if out.contains("__OK__") { Ok(out.replace("__OK__", "").trim().to_string()) } else { Err(out.trim().to_string()) }
+}
+
+fn valid_mode(m: &str) -> bool {
+    (3..=4).contains(&m.len()) && m.chars().all(|c| ('0'..='7').contains(&c))
+}
+
+fn valid_owner(o: &str) -> bool {
+    let ok = |p: &str| p.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-');
+    match o.split_once(':') {
+        Some((u, g)) => ok(u) && ok(g) && !(u.is_empty() && g.is_empty()),
+        None => !o.is_empty() && ok(o),
+    }
+}
+
+/// 권한(chmod)과 선택적으로 소유자(chown)를 바꾼다. `recursive` 면 폴더 안까지 적용.
+#[tauri::command]
+pub async fn remote_chmod(
+    state: State<'_, AppState>,
+    session_id: String,
+    paths: Vec<String>,
+    mode: String,
+    recursive: bool,
+    owner: String,
+) -> R<String> {
+    if !valid_mode(&mode) {
+        return Err("권한은 755 같은 8진수 3~4자리여야 해요".into());
+    }
+    if !owner.is_empty() && !valid_owner(&owner) {
+        return Err("소유자 형식이 올바르지 않아요 (예: www-data:www-data)".into());
+    }
+    if paths.is_empty() {
+        return Err("대상이 없어요".into());
+    }
+    let s = state.session(&session_id).await?;
+    let list = paths.iter().map(|p| sh_quote(p)).collect::<Vec<_>>().join(" ");
+    let r = if recursive { "-R " } else { "" };
+    // 경로는 항상 절대 경로(/ 로 시작)라서 옵션으로 오해될 일이 없다. (BSD chmod 는 모드 뒤의 -- 를 파일로 읽는다)
+    let mut cmd = format!("chmod {r}{mode} {list}");
+    if !owner.is_empty() {
+        cmd.push_str(&format!(" && chown {r}{owner} {list}"));
+    }
+    script_ok(run_sh(&s, &format!("{{ {cmd}; }} 2>&1 && echo __OK__\n"), 120).await?)
+}
+
+/// 압축 스크립트를 만든다. 원본은 기본적으로 그대로 두고, `delete_source` 면 압축본을 검증한 뒤에만 원본을 지운다.
+/// `out_dir` 이 비어 있으면 `cwd` 에 만든다. format: "tgz" | "zip"
+fn archive_script(cwd: &str, names: &[String], out: &str, out_dir: &str, format: &str, delete_source: bool) -> R<String> {
+    if out.is_empty() || out.contains('/') || out.starts_with('-') {
+        return Err("압축 파일 이름이 올바르지 않아요".into());
+    }
+    if names.is_empty() || names.iter().any(|n| n.is_empty() || n.contains('/') || n == "." || n == "..") {
+        return Err("대상이 올바르지 않아요".into());
+    }
+    if !cwd.starts_with('/') || (!out_dir.is_empty() && !out_dir.starts_with('/')) {
+        return Err("경로는 / 로 시작하는 전체 경로여야 해요".into());
+    }
+    let base = cwd.trim_end_matches('/');
+    let dest_dir = if out_dir.is_empty() { base.to_string() } else { out_dir.trim_end_matches('/').to_string() };
+    // 압축 파일을 압축 대상 폴더 안에 만들면 자기 자신을 다시 담게 되므로 막는다
+    for n in names {
+        let src = format!("{base}/{n}");
+        if dest_dir == src || dest_dir.starts_with(&format!("{src}/")) {
+            return Err(format!("저장 위치가 압축할 폴더 “{n}” 안이에요. 다른 위치를 고르세요"));
+        }
+    }
+    if delete_source && base.is_empty() {
+        return Err("루트(/) 폴더에서는 원본 삭제를 쓸 수 없어요".into());
+    }
+    let target = format!("{}/{}", if dest_dir.is_empty() { "" } else { &dest_dir }, out);
+    let (t, list) = (sh_quote(&target), names.iter().map(|n| sh_quote(n)).collect::<Vec<_>>().join(" "));
+    let (make, verify) = match format {
+        "tgz" => (format!("tar -czf {t} -- {list}"), format!("tar -tzf {t} >/dev/null")),
+        "zip" => (
+            format!("command -v zip >/dev/null 2>&1 || {{ echo '서버에 zip 이 설치돼 있지 않아요 (tar.gz 를 쓰세요)'; exit 1; }}; zip -qr {t} -- {list}"),
+            format!("[ -s {t} ]"),
+        ),
+        _ => return Err("지원하지 않는 형식이에요".into()),
+    };
+    let mut script = format!(
+        "cd {} || exit 1\n[ -d {} ] || {{ echo '저장 위치 폴더가 없어요'; exit 1; }}\n[ -e {t} ] && {{ echo '같은 이름의 파일이 이미 있어요'; exit 1; }}\n",
+        sh_quote(base.if_empty("/")),
+        sh_quote(dest_dir.as_str().if_empty("/")),
+    );
+    script.push_str(&format!("{{ {make}; }} 2>&1 || {{ rm -f {t}; exit 1; }}\n"));
+    // 압축본이 읽히는지 확인하기 전에는 절대 원본을 지우지 않는다
+    script.push_str(&format!("{{ {verify}; }} 2>&1 || {{ echo '압축 파일 검증에 실패해서 중단했어요 (원본은 그대로예요)'; exit 1; }}\n"));
+    if delete_source {
+        script.push_str(&format!("rm -rf -- {list} 2>&1 || {{ echo '압축은 됐지만 원본 일부를 지우지 못했어요'; exit 1; }}\n"));
+    }
+    script.push_str("echo __OK__\n");
+    Ok(script)
+}
+
+trait IfEmpty {
+    fn if_empty<'a>(&'a self, fallback: &'a str) -> &'a str;
+}
+impl IfEmpty for str {
+    fn if_empty<'a>(&'a self, fallback: &'a str) -> &'a str {
+        if self.is_empty() { fallback } else { self }
+    }
+}
+
+/// `cwd` 안의 `names` 를 하나의 압축 파일로 묶는다.
+#[tauri::command]
+pub async fn remote_archive(
+    state: State<'_, AppState>,
+    session_id: String,
+    cwd: String,
+    names: Vec<String>,
+    out: String,
+    out_dir: String,
+    format: String,
+    delete_source: bool,
+) -> R<String> {
+    let script = archive_script(&cwd, &names, &out, &out_dir, &format, delete_source)?;
+    let s = state.session(&session_id).await?;
+    script_ok(run_sh(&s, &script, 900).await?)
+}
+
+/// 압축 파일을 `dest` 폴더에 푼다 (같은 이름의 파일은 덮어쓴다).
+#[tauri::command]
+pub async fn remote_extract(
+    state: State<'_, AppState>,
+    session_id: String,
+    path: String,
+    dest: String,
+) -> R<String> {
+    let lower = path.to_lowercase();
+    let (p, d) = (sh_quote(&path), sh_quote(&dest));
+    let cmd = if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+        format!("tar -xzf {p} -C {d}")
+    } else if lower.ends_with(".tar.bz2") || lower.ends_with(".tbz2") {
+        format!("tar -xjf {p} -C {d}")
+    } else if lower.ends_with(".tar.xz") || lower.ends_with(".txz") {
+        format!("tar -xJf {p} -C {d}")
+    } else if lower.ends_with(".tar") {
+        format!("tar -xf {p} -C {d}")
+    } else if lower.ends_with(".zip") {
+        format!("command -v unzip >/dev/null 2>&1 || {{ echo '서버에 unzip 이 설치돼 있지 않아요'; exit 1; }}; unzip -oq {p} -d {d}")
+    } else if lower.ends_with(".gz") {
+        format!("gunzip -kf {p}")
+    } else {
+        return Err("지원하지 않는 압축 형식이에요 (.tar.gz .tgz .tar.bz2 .tar.xz .tar .zip .gz)".into());
+    };
+    let s = state.session(&session_id).await?;
+    script_ok(run_sh(&s, &format!("{{ {cmd}; }} 2>&1 && echo __OK__\n"), 900).await?)
+}
+
+// ───────────────────────── SSH 키 만들기 / 서버에 등록 ─────────────────────────
+
+#[derive(Serialize)]
+pub struct KeyInfo {
+    path: String,   // 개인키 경로 (~ 로 시작하는 표기)
+    public: String, // 공개키 한 줄
+}
+
+/// 내 맥에 ed25519 키 한 쌍을 만든다 (~/.ssh/ssh-gui_<name>, 권한 600). 이미 있으면 거부.
+#[tauri::command]
+pub fn key_generate(name: String, passphrase: String) -> R<KeyInfo> {
+    use russh::keys::{Algorithm, PrivateKey};
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    if name.is_empty() || name.len() > 60 || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-') {
+        return Err("키 이름에는 영문/숫자/.-_ 만 쓸 수 있어요".into());
+    }
+    let dir = dirs::home_dir().ok_or("홈 폴더를 찾지 못했어요")?.join(".ssh");
+    std::fs::create_dir_all(&dir).map_err(e2s)?;
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let path = dir.join(format!("ssh-gui_{name}"));
+    let pub_path = dir.join(format!("ssh-gui_{name}.pub"));
+    if path.exists() || pub_path.exists() {
+        return Err(format!("~/.ssh/ssh-gui_{name} 이(가) 이미 있어요. 다른 이름을 쓰세요"));
+    }
+
+    let mut rng = rand::rng();
+    let mut key = PrivateKey::random(&mut rng, Algorithm::Ed25519).map_err(e2s)?;
+    key.set_comment(format!("ssh-gui@{name}"));
+    let key = if passphrase.is_empty() { key } else { key.encrypt(&mut rng, passphrase.as_bytes()).map_err(e2s)? };
+
+    let pem = key.to_openssh(russh::keys::ssh_key::LineEnding::LF).map_err(e2s)?;
+    let public = key.public_key().to_openssh().map_err(e2s)?;
+
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path).map_err(e2s)?;
+    f.write_all(pem.as_bytes()).map_err(e2s)?;
+    std::fs::write(&pub_path, format!("{public}\n")).map_err(e2s)?;
+    Ok(KeyInfo { path: format!("~/.ssh/ssh-gui_{name}"), public })
+}
+
+/// 현재 접속한 서버의 ~/.ssh/authorized_keys 에 공개키를 추가한다 (이미 있으면 그대로 둠).
+#[tauri::command]
+pub async fn key_install(state: State<'_, AppState>, session_id: String, public_key: String) -> R<String> {
+    let k = public_key.trim();
+    let ok_type = ["ssh-ed25519 ", "ssh-rsa ", "ecdsa-sha2-"].iter().any(|t| k.starts_with(t));
+    if !ok_type || k.contains('\n') || k.contains('\r') {
+        return Err("올바른 공개키 한 줄이 아니에요".into());
+    }
+    let s = state.session(&session_id).await?;
+    let q = sh_quote(k);
+    let script = format!(
+        "umask 077\nmkdir -p \"$HOME/.ssh\" && touch \"$HOME/.ssh/authorized_keys\" || exit 1\n\
+         grep -qxF {q} \"$HOME/.ssh/authorized_keys\" || printf '%s\\n' {q} >> \"$HOME/.ssh/authorized_keys\"\n\
+         chmod 700 \"$HOME/.ssh\"; chmod 600 \"$HOME/.ssh/authorized_keys\"\n\
+         echo __OK__\n"
+    );
+    script_ok(run_sh(&s, &script, 20).await?)
+}
+
+/// 접속 정보로 실제 로그인이 되는지만 확인하고 바로 끊는다 (키 전환 후 검증용).
+#[tauri::command]
+pub async fn ssh_test(args: ConnectArgs) -> R<()> {
+    let Opened { handle, .. } = open_handle(&args).await?;
+    let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
+    Ok(())
+}
+
+// ───────────────────────── SSH 터널링 (로컬 포트 포워딩) ─────────────────────────
+
+type Sessions = Arc<Mutex<HashMap<String, Arc<SshSession>>>>;
+
+/// listener 로 들어오는 연결마다 SSH 채널(direct-tcpip)을 열어 양방향으로 이어 준다.
+fn spawn_tunnel(
+    sessions: Sessions,
+    sid: String,
+    listener: tokio::net::TcpListener,
+    host: String,
+    port: u16,
+    on_err: Arc<dyn Fn(String) + Send + Sync>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut conns = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                acc = listener.accept() => {
+                    let Ok((mut tcp, peer)) = acc else { continue };
+                    let (sessions, sid, host, on_err) = (sessions.clone(), sid.clone(), host.clone(), on_err.clone());
+                    conns.spawn(async move {
+                        // 재접속으로 세션이 교체돼도 새 연결을 쓰도록, 연결마다 현재 세션을 찾는다
+                        let Some(sess) = sessions.lock().await.get(&sid).cloned() else { return };
+                        match sess.handle.channel_open_direct_tcpip(host.clone(), port as u32, "127.0.0.1", peer.port() as u32).await {
+                            Ok(ch) => {
+                                let mut st = ch.into_stream();
+                                let _ = tokio::io::copy_bidirectional(&mut tcp, &mut st).await;
+                            }
+                            Err(e) => on_err(format!("서버가 {host}:{port} 에 연결하지 못했어요: {e}")),
+                        }
+                    });
+                }
+                Some(_) = conns.join_next(), if !conns.is_empty() => {}
+            }
+        }
+    })
+}
+
+#[derive(Serialize, Clone)]
+struct TunnelErr {
+    id: String,
+    message: String,
+}
+
+/// 내 맥의 127.0.0.1:`local_port` 로 들어온 연결을, 서버를 통해 `remote_host:remote_port` 로 이어 준다.
+/// (ssh -L local_port:remote_host:remote_port 와 같은 동작. 내 맥 안에서만 열리고 외부 접속은 받지 않는다.)
+#[tauri::command]
+pub async fn tunnel_start(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+    tunnel_id: String,
+    local_port: u16,
+    remote_host: String,
+    remote_port: u16,
+) -> R<()> {
+    if local_port < 1024 {
+        return Err("내 맥 포트는 1024 이상으로 정하세요 (1024 미만은 관리자 권한이 필요해요)".into());
+    }
+    if remote_host.is_empty() || remote_host.len() > 253 || remote_port == 0 {
+        return Err("서버 쪽 주소/포트가 올바르지 않아요".into());
+    }
+    state.session(&session_id).await?;
+    if state.tunnels.lock().await.contains_key(&tunnel_id) {
+        return Err("이미 켜져 있는 터널이에요".into());
+    }
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", local_port)).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AddrInUse {
+            format!("포트 {local_port} 은(는) 이미 다른 프로그램이 쓰고 있어요. 다른 포트를 고르세요")
+        } else {
+            e2s(e)
+        }
+    })?;
+
+    let (app2, tid) = (app.clone(), tunnel_id.clone());
+    let on_err: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |message| {
+        let _ = app2.emit("tunnel-error", TunnelErr { id: tid.clone(), message });
+    });
+    let task = spawn_tunnel(state.sessions.clone(), session_id.clone(), listener, remote_host, remote_port, on_err);
+    state.tunnels.lock().await.insert(tunnel_id, TunnelHandle { session_id, task });
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn tunnel_stop(state: State<'_, AppState>, tunnel_id: String) -> R<()> {
+    if let Some(t) = state.tunnels.lock().await.remove(&tunnel_id) {
+        t.task.abort(); // JoinSet 이 함께 정리되어 진행 중인 연결도 끊긴다
+    }
+    Ok(())
 }

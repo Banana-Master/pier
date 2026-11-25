@@ -1,4 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
+import { createAlertEngine, getAlertCfg } from "./alerts";
+import { parseMountLine, diskKind } from "./sysparse";
 
 const INTERVAL = 2000; // 조회 간격(ms)
 const HIST = 90; // 보관 샘플 수 (2초 × 90 = 3분)
@@ -19,7 +21,8 @@ interface Line { data: number[]; color: string; name: string }
 interface Graph { title: string; lines: Line[]; max: number | "auto"; fmt: (n: number) => string; footer?: string; html?: string }
 
 /** 상태바를 `bar` 안에 그리고 주기적으로 갱신한다. 반환값을 호출하면 정지. */
-export function startMonitor(sid: string, bar: HTMLElement): () => void {
+export function startMonitor(sid: string, bar: HTMLElement, onAlert?: (title: string, body: string) => void): () => void {
+  const engine = onAlert ? createAlertEngine(getAlertCfg, onAlert, INTERVAL) : null;
   const hist = { cpu: [] as number[], mem: [] as number[], rx: [] as number[], tx: [] as number[], temp: [] as number[], load: [] as number[] };
   const push = (a: number[], v: number) => { a.push(v); if (a.length > HIST) a.shift(); };
 
@@ -133,6 +136,7 @@ export function startMonitor(sid: string, bar: HTMLElement): () => void {
     busy = true;
     try {
       const { m, pd, mnt } = parse(await invoke<string>("sys_stats", { sessionId: sid }));
+      let memPct: number | null = null, diskPct: number | null = null;
       if (!m.STAT) throw new Error("no /proc");
       fails = 0;
       if (!built) build();
@@ -160,6 +164,7 @@ export function startMonitor(sid: string, bar: HTMLElement): () => void {
       for (const x of (m.MEM || "").matchAll(/(\w+):=(\d+)/g)) mem[x[1]] = parseInt(x[2], 10);
       if (mem.MemTotal) {
         const used = mem.MemTotal - (mem.MemAvailable ?? 0), pct = (used / mem.MemTotal) * 100;
+        memPct = pct;
         push(hist.mem, pct);
         set("mem", `${fmtKB(used)} / ${fmtKB(mem.MemTotal)}`, pct);
         const swap = mem.SwapTotal ? `스왑 ${fmtKB(mem.SwapTotal - (mem.SwapFree ?? 0))} / ${fmtKB(mem.SwapTotal)}` : "스왑 없음";
@@ -168,13 +173,13 @@ export function startMonitor(sid: string, bar: HTMLElement): () => void {
 
       // 디스크: 물리 디스크 목록 + 마운트별 사용량
       const disks = pd.map((l) => Object.fromEntries([...l.matchAll(/(\w+)="([^"]*)"/g)].map((x) => [x[1], x[2]])));
-      const mounts = mnt.map((l) => { const p = l.split(/\s+/); return { dev: p[0], fs: p[1], total: Number(p[2]), used: Number(p[3]), pct: parseInt(p[5], 10), at: p.slice(6).join(" ") }; });
+      const mounts = mnt.map(parseMountLine).filter((x): x is NonNullable<typeof x> => x !== null);
       const root = mounts.find((x) => x.at === "/") ?? mounts[0];
       if (root) {
+        diskPct = root.pct;
         set("disk", `${fmtKB(root.used)} / ${fmtKB(root.total)}${disks.length ? ` · 물리 ${disks.length}개` : ""}`, root.pct);
-        const kind = (d: Record<string, string>) => (d.TRAN === "nvme" || d.NAME?.startsWith("nvme") ? "NVMe SSD" : d.ROTA === "1" ? "HDD" : "SSD");
         const dHtml = disks.length
-          ? disks.map((d) => `<div class="dk"><b>/dev/${esc(d.NAME)}</b> <span>${fmtBytes(Number(d.SIZE))} · ${kind(d)}${d.TRAN && d.TRAN !== "nvme" ? " · " + esc(d.TRAN) : ""}</span><div class="md">${esc(d.MODEL.trim() || "모델 정보 없음")}</div></div>`).join("")
+          ? disks.map((d) => `<div class="dk"><b>/dev/${esc(d.NAME)}</b> <span>${fmtBytes(Number(d.SIZE))} · ${diskKind(d)}${d.TRAN && !["nvme", "usb"].includes(d.TRAN) ? " · " + esc(d.TRAN) : ""}</span><div class="md">${esc(d.MODEL.trim() || "모델 정보 없음")}</div></div>`).join("")
           : `<div class="md">물리 디스크 정보를 가져올 수 없어요 (가상 서버/컨테이너일 수 있음)</div>`;
         const mHtml = mounts.map((x) => `<div class="mt"><span>${esc(x.at)} <em>${esc(x.fs)}</em></span><i class="mini"><u style="width:${x.pct}%;background:${level(x.pct)}"></u></i><span>${fmtKB(x.used)} / ${fmtKB(x.total)} (${x.pct}%)</span></div>`).join("");
         graphs.disk = { title: `물리 디스크 ${disks.length}개 · 마운트 ${mounts.length}개`, lines: [], max: 100, fmt: String, html: `${dHtml}<div class="sep"></div>${mHtml}` };
@@ -195,6 +200,8 @@ export function startMonitor(sid: string, bar: HTMLElement): () => void {
         graphs.temp = { title: "온도 (가장 높은 센서)", lines: [{ data: hist.temp, color: "#ff8a4c", name: "온도" }], max: "auto", fmt: (n) => n.toFixed(0) + "°C" };
       } else els.temp?.root.classList.add("na");
       if (m.UP) set("up", fmtUptime(parseFloat(m.UP)));
+
+      engine?.check({ cpu: cpuPct, mem: memPct, disk: diskPct, temp: Number.isFinite(tempC) && tempC > 0 ? tempC : null });
 
       graphs.cpu = { title: "CPU 사용률", lines: [{ data: hist.cpu, color: "#3ecf8e", name: "CPU" }], max: 100, fmt: (n) => n.toFixed(0) + "%", footer: cores ? `${cores}코어` : "" };
       graphs.net = { title: "네트워크 속도", lines: [{ data: hist.rx, color: "#4f8cff", name: "↓" }, { data: hist.tx, color: "#f0b429", name: "↑" }], max: "auto", fmt: (n) => fmtBytes(n) + "/s" };

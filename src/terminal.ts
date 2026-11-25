@@ -5,11 +5,11 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import "@xterm/xterm/css/xterm.css";
 
 /** 터미널 한 칸 (분할되면 한 그룹에 여러 개) */
-export interface TP { term: Terminal; fit: FitAddon; termId: string; el: HTMLElement }
+export interface TP { term: Terminal; fit: FitAddon; termId: string; el: HTMLElement; slot: number }
 
 export interface GroupOpts {
   /** 셸을 열고 termId 를 돌려준다 (SSH 셸 / 로컬 셸) */
-  open: (cols: number, rows: number) => Promise<string>;
+  open: (cols: number, rows: number, slot: number) => Promise<string>;
   /** 셸이 알려주는 현재 경로(OSC 7) */
   onCwd?: (path: string) => void;
   /** 열린 직후 경로 알림 훅을 주입할지 (원격 bash/zsh 용) */
@@ -69,7 +69,7 @@ export class TermGroup {
 
     const term = new Terminal({
       fontFamily: 'Menlo, "SF Mono", Consolas, monospace', fontSize: 13, cursorBlink: true,
-      scrollback: 10000, allowProposedApi: true,
+      scrollback: 10000, allowProposedApi: true, macOptionClickForcesSelection: true,
       theme: { background: "#14161b", foreground: "#d7dae0", cursor: "#4f8cff", selectionBackground: "#3d5a99" },
     });
     const fit = new FitAddon();
@@ -84,7 +84,11 @@ export class TermGroup {
       term.loadAddon(gl);
     } catch { /* WebGL 불가 시 기본 렌더러 */ }
 
-    const tp: TP = { term, fit, termId: "", el };
+    // 칸마다 고정 번호(slot): tmux 세션 이름과 재접속 시 복구에 쓴다
+    const used = new Set(this.panes.map((p) => p.slot));
+    let slot = 1;
+    while (used.has(slot)) slot++;
+    const tp: TP = { term, fit, termId: "", el, slot };
     this.panes.push(tp);
     this.focused = tp;
     this.layout();
@@ -100,7 +104,7 @@ export class TermGroup {
     $on(el, ".tclose", () => { void invoke("term_close", { termId: tp.termId }); this.removePane(tp); });
 
     try {
-      tp.termId = await this.opts.open(term.cols, term.rows);
+      tp.termId = await this.opts.open(term.cols, term.rows, slot);
     } catch (e) {
       this.removePane(tp);
       throw e;
@@ -122,7 +126,7 @@ export class TermGroup {
   /** 연결이 새로 만들어진 뒤, 같은 화면(스크롤백 유지)에 새 셸을 다시 연다. */
   async reopen(tp: TP, msg = "다시 연결되었습니다") {
     registry.delete(tp.termId);
-    tp.termId = await this.opts.open(tp.term.cols, tp.term.rows);
+    tp.termId = await this.opts.open(tp.term.cols, tp.term.rows, tp.slot);
     this.bind(tp);
     tp.term.write(`\r\n\x1b[32m[${msg}]\x1b[0m\r\n`);
     this.injectHook(tp);
