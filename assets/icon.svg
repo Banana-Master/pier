@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2b3d63"/>
+      <stop offset="1" stop-color="#0d1424"/>
+    </linearGradient>
+    <linearGradient id="glow" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5aa2ff" stop-opacity=".55"/>
+      <stop offset="1" stop-color="#2f6fe0" stop-opacity=".25"/>
+    </linearGradient>
+    <clipPath id="tile"><rect x="100" y="100" width="824" height="824" rx="210"/></clipPath>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="210" fill="url(#bg)"/>
+  <g clip-path="url(#tile)">
+    <!-- 부두 기둥 -->
+    <rect x="262" y="690" width="46" height="170" rx="14" fill="#9aa8c4"/>
+    <rect x="489" y="690" width="46" height="170" rx="14" fill="#9aa8c4"/>
+    <rect x="716" y="690" width="46" height="170" rx="14" fill="#9aa8c4"/>
+    <!-- 물결: 기둥 아래쪽이 물에 잠긴 느낌 -->
+    <path d="M100 790 C 210 758 320 822 440 790 S 670 758 790 790 S 890 800 924 790 L924 924 L100 924 Z" fill="url(#glow)"/>
+    <path d="M100 850 C 230 826 330 880 460 850 S 690 826 800 850 S 890 858 924 850 L924 924 L100 924 Z" fill="#4f8cff" fill-opacity=".28"/>
+  </g>
+  <!-- 부두 상판 -->
+  <rect x="200" y="640" width="624" height="52" rx="26" fill="#eef2fa"/>
+  <!-- 터미널 프롬프트 > _ -->
+  <polyline points="290,290 430,400 290,510" fill="none" stroke="#5aa2ff" stroke-width="68" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="500" y="466" width="210" height="58" rx="29" fill="#ffffff"/>
+</svg>

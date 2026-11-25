@@ -51,6 +51,16 @@ src-tauri/src/
   ssh.rs             SSH/SFTP, 터미널, 키체인 등 백엔드 (russh)
 ```
 
+## 아이콘
+
+원본은 `assets/icon.svg` 예요. 바꾸고 나서 아래 명령으로 모든 크기(맥 `.icns`, Windows `.ico`, PNG)를 다시 만들 수 있어요.
+
+```bash
+npx tauri icon assets/icon.svg
+```
+
+(안드로이드/iOS 폴더가 같이 생기면 지워도 돼요. 이 앱은 데스크톱 전용이에요.)
+
 ## 이름에 대해
 
 앱 이름은 **Pier** 예요. 이전 이름(`ssh-gui`)으로 저장된 데이터(접속 목록 폴더, 키체인 항목, 앱 식별자 `com.sshgui.app`)는 그대로 유지해서, 이름을 바꿔도 저장해 둔 접속과 비밀번호는 그대로 쓸 수 있어요.
