@@ -338,3 +338,6 @@ code { background: var(--bg3); padding: 0 5px; border-radius: 4px; font-family: 
 .alert-tbl input { width: 64px; display: inline-block; text-align: right; }
 .ptool span { white-space: nowrap; }
 .ver { color: var(--dim, #888); font-size: 12px; margin-left: 8px; font-weight: normal; }
+.upd-msg { margin: 10px 0; font-size: 13px; }
+.upd-bar { height: 8px; background: var(--bg3); border-radius: 4px; overflow: hidden; }
+.upd-fill { height: 100%; width: 0; background: var(--accent); transition: width .15s; }

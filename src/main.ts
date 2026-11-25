@@ -1786,16 +1786,39 @@ async function init() {
 let updating = false;
 async function updateFlow(manual: boolean) {
   if (updating) return;
+  let u;
   try {
-    const u = await checkUpdate();
-    if (!u) { if (manual) toast("최신 버전이에요"); return; }
-    if (!(await askConfirm(`새 버전 ${u.version}이 있어요. 지금 업데이트할까요?`, "받은 뒤 앱이 자동으로 다시 시작돼요."))) return;
-    updating = true;
-    toast("업데이트를 받는 중이에요…");
-    await u.downloadAndInstall();
-    await relaunch();
+    u = await checkUpdate();
   } catch (e) {
     if (manual) toast(`업데이트 확인 실패: ${errMsg(e)}`, true);
+    return;
+  }
+  if (!u) { if (manual) toast("최신 버전이에요"); return; }
+  if (!(await askConfirm(`새 버전 ${u.version}이 있어요. 지금 업데이트할까요?`, "받은 뒤 앱이 자동으로 다시 시작돼요."))) return;
+  updating = true;
+  const box = document.createElement("div");
+  box.className = "overlay";
+  box.innerHTML = `<div class="modal" style="width:360px"><h3>업데이트 ${u.version}</h3><div class="upd-msg">준비하는 중…</div><div class="upd-bar"><div class="upd-fill"></div></div></div>`;
+  document.body.appendChild(box);
+  const msg = box.querySelector(".upd-msg") as HTMLElement;
+  const fill = box.querySelector(".upd-fill") as HTMLElement;
+  let total = 0, got = 0;
+  const mb = (n: number) => (n / 1048576).toFixed(1);
+  try {
+    await u.downloadAndInstall((ev) => {
+      if (ev.event === "Started") { total = ev.data.contentLength ?? 0; msg.textContent = "내려받는 중…"; }
+      else if (ev.event === "Progress") {
+        got += ev.data.chunkLength;
+        if (total) { fill.style.width = `${Math.min(100, (got / total) * 100)}%`; msg.textContent = `내려받는 중… ${mb(got)} / ${mb(total)} MB`; }
+        else msg.textContent = `내려받는 중… ${mb(got)} MB`;
+      } else if (ev.event === "Finished") { fill.style.width = "100%"; msg.textContent = "설치하는 중…"; }
+    });
+    msg.textContent = "설치했어요. 앱을 다시 시작해요…";
+    await new Promise((r) => setTimeout(r, 800));
+    await relaunch();
+  } catch (e) {
+    box.remove();
+    toast(`업데이트 실패: ${errMsg(e)}`, true);
   } finally { updating = false; }
 }
 setTimeout(() => void updateFlow(false), 4000);
