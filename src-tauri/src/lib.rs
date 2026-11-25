@@ -56,6 +56,7 @@ pub fn run() {
             ssh::ext_apps,
             ssh::ext_open,
             ssh::ext_resolve,
+            ssh::notify_os,
             ssh::ssh_config_hosts,
             ssh::sftp_read_text,
             ssh::sftp_write_text,

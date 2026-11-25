@@ -1482,6 +1482,36 @@ pub async fn ext_resolve(state: State<'_, AppState>, id: String, overwrite: bool
     Ok(())
 }
 
+// ───────────────────────── 맥 알림 ─────────────────────────
+
+/// 맥 알림을 보낸다.
+///
+/// 맥에서는 `osascript` 로 보낸다. 알림 플러그인은 개발 모드(`tauri dev`)에서 "Terminal" 인 척하고 보내는데, 이 방식은
+/// 맥이 거부하기도 해서(로그: Denying message from com.apple.Terminal) 알림이 조용히 사라진다. osascript 는 시스템
+/// 앱(Script Editor) 이름으로 확실히 전달된다. 제목/내용은 AppleScript 인자로 넘겨서 따옴표가 있어도 안전하다.
+#[tauri::command]
+pub fn notify_os(app: AppHandle, title: String, body: String) -> R<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = &app;
+        let out = std::process::Command::new("osascript")
+            .args(["-e", "on run argv", "-e", "display notification (item 2 of argv) with title (item 1 of argv)", "-e", "end run"])
+            .arg(&title)
+            .arg(&body)
+            .output()
+            .map_err(e2s)?;
+        if out.status.success() {
+            return Ok(());
+        }
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        use tauri_plugin_notification::NotificationExt;
+        app.notification().builder().title(title).body(body).show().map_err(e2s)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

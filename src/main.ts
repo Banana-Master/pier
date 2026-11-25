@@ -3,7 +3,6 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { getAlertCfg, setAlertCfg, DEFAULT_ALERTS } from "./alerts";
 import { TermGroup, routeData, routeExit, type TP } from "./terminal";
 import { startMonitor } from "./monitor";
@@ -863,13 +862,10 @@ function openTunnels(s: Sess) {
 }
 
 // ───────────── 서버 상태 알림 ─────────────
-async function osNotify(title: string, body: string): Promise<boolean> {
-  try {
-    let ok = await isPermissionGranted();
-    if (!ok) ok = (await requestPermission()) === "granted";
-    if (ok) sendNotification({ title, body });
-    return ok;
-  } catch { return false; }
+/** 맥 알림을 보낸다. 성공하면 null, 실패하면 오류 문구를 돌려준다. */
+async function osNotify(title: string, body: string): Promise<string | null> {
+  try { await invoke("notify_os", { title, body }); return null; }
+  catch (e) { return errMsg(e); }
 }
 
 async function alertFired(s: Sess, title: string, body: string) {
@@ -897,13 +893,12 @@ function openAlertSettings() {
   $("#x", m.box).onclick = m.close;
   $("#atest", m.box).onclick = async () => {
     const err = $("#aerr2", m.box);
-    const ok = await osNotify("SSH GUI 알림 테스트", "이 알림이 보이면 설정이 잘 된 거예요.");
+    const fail = await osNotify("SSH GUI 알림 테스트", "이 알림이 보이면 설정이 잘 된 거예요.");
+    const ok = fail === null;
     err.style.color = ok ? "var(--dim)" : "";
     // 맥이 알림을 받아도 화면 표시를 막는 경우(알림 스타일 “없음”)는 앱이 알 수 없어서, 안 보일 때 확인할 곳을 알려 준다
-    err.textContent = !ok ? "알림을 보내지 못했어요. 시스템 설정 → 알림에서 확인하세요."
-      : import.meta.env.DEV
-        ? "알림을 보냈어요. 안 보이면: 개발 모드(tauri dev)에서는 알림이 “Terminal” 이름으로 가요. 시스템 설정 → 알림 → Terminal 에서 ‘알림 허용’을 켜고 스타일을 “배너”로 바꿔 주세요. (배포용 앱은 “SSH GUI” 이름으로 와요)"
-        : "알림을 보냈어요. 안 보이면: 시스템 설정 → 알림 → SSH GUI 에서 ‘알림 허용’을 켜고 스타일을 “배너”로 바꿔 주세요.";
+    err.textContent = !ok ? `알림을 보내지 못했어요: ${fail}`
+      : "알림을 보냈어요. 안 보이면: 시스템 설정 → 알림 → “Script Editor” 에서 ‘알림 허용’을 켜고 스타일을 “배너”로 바꿔 주세요. (맥 내장 방식이라 알림이 “Script Editor” 이름으로 표시돼요. 집중 모드/방해 금지가 켜져 있어도 숨겨져요)";
   };
   $("#areset", m.box).onclick = () => {
     const d = DEFAULT_ALERTS;
