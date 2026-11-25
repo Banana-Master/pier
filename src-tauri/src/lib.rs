@@ -4,6 +4,36 @@ mod ssh;
 pub fn run() {
     ssh::cleanup_ext_cache();
     tauri::Builder::default()
+        .menu(|h| {
+            use tauri::menu::{Menu, PredefinedMenuItem as P, Submenu};
+            let app = Submenu::with_items(h, "Pier", true, &[
+                &P::about(h, Some("Pier 정보"), None)?,
+                &P::separator(h)?,
+                &P::services(h, Some("서비스"))?,
+                &P::separator(h)?,
+                &P::hide(h, Some("Pier 가리기"))?,
+                &P::hide_others(h, Some("다른 항목 가리기"))?,
+                &P::show_all(h, Some("모두 보기"))?,
+                &P::separator(h)?,
+                &P::quit(h, Some("Pier 종료"))?,
+            ])?;
+            let file = Submenu::with_items(h, "파일", true, &[&P::close_window(h, Some("윈도우 닫기"))?])?;
+            let edit = Submenu::with_items(h, "편집", true, &[
+                &P::undo(h, Some("실행 취소"))?,
+                &P::redo(h, Some("다시 실행"))?,
+                &P::separator(h)?,
+                &P::cut(h, Some("잘라내기"))?,
+                &P::copy(h, Some("복사"))?,
+                &P::paste(h, Some("붙여넣기"))?,
+                &P::select_all(h, Some("전체 선택"))?,
+            ])?;
+            let view = Submenu::with_items(h, "보기", true, &[&P::fullscreen(h, Some("전체 화면"))?])?;
+            let win = Submenu::with_items(h, "윈도우", true, &[
+                &P::minimize(h, Some("최소화"))?,
+                &P::maximize(h, Some("확대/축소"))?,
+            ])?;
+            Menu::with_items(h, &[&app, &file, &edit, &view, &win])
+        })
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
