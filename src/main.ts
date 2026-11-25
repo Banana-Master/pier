@@ -2,6 +2,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { check as checkUpdate } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { getAlertCfg, setAlertCfg, DEFAULT_ALERTS } from "./alerts";
 import { TermGroup, routeData, routeExit, type TP } from "./terminal";
@@ -282,7 +285,7 @@ const UNGROUPED = "미분류";
 
 function renderHome() {
   const home = $("#home");
-  home.innerHTML = `<h2>저장된 접속 <button id="add" class="primary">＋ 새 접속</button><button id="local">💻 로컬 터미널</button><button id="imp" title="~/.ssh/config 에 있는 호스트를 불러옵니다">⤓ ssh config 가져오기</button></h2>
+  home.innerHTML = `<h2>저장된 접속 <button id="add" class="primary">＋ 새 접속</button><button id="local">💻 로컬 터미널</button><button id="imp" title="~/.ssh/config 에 있는 호스트를 불러옵니다">⤓ ssh config 가져오기</button><button id="upd" title="새 버전이 있는지 확인합니다">⟳ 업데이트 확인</button><span id="ver" class="ver"></span></h2>
     <input id="hq" class="hq" placeholder="🔍 이름 · 호스트 · 사용자 · 폴더로 검색  (⌘K)" spellcheck="false"/>
     <div class="groups"></div>`;
   const hq = $<HTMLInputElement>("#hq", home);
@@ -292,6 +295,8 @@ function renderHome() {
   $("#add", home).onclick = () => connectDialog(null);
   $("#local", home).onclick = () => void openLocal();
   $("#imp", home).onclick = () => void importSshConfig();
+  $("#upd", home).onclick = () => void updateFlow(true);
+  void getVersion().then((v) => { $("#ver", home).textContent = "v" + v; }).catch(() => {});
   renderGroups();
 }
 
@@ -1776,5 +1781,23 @@ async function init() {
   $("#home").classList.add("show");
   await loadProfiles();
 }
+
+// ── 앱 업데이트 (GitHub 릴리스) ──
+let updating = false;
+async function updateFlow(manual: boolean) {
+  if (updating) return;
+  try {
+    const u = await checkUpdate();
+    if (!u) { if (manual) toast("최신 버전이에요"); return; }
+    if (!(await askConfirm(`새 버전 ${u.version}이 있어요. 지금 업데이트할까요?`, "받은 뒤 앱이 자동으로 다시 시작돼요."))) return;
+    updating = true;
+    toast("업데이트를 받는 중이에요…");
+    await u.downloadAndInstall();
+    await relaunch();
+  } catch (e) {
+    if (manual) toast(`업데이트 확인 실패: ${errMsg(e)}`, true);
+  } finally { updating = false; }
+}
+setTimeout(() => void updateFlow(false), 4000);
 
 void init();

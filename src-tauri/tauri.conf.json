@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Pier",
   "mainBinaryName": "Pier",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "identifier": "com.sshgui.app",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -14,8 +14,12 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "Pier", "titleBarStyle": "Overlay", "hiddenTitle": true,
-        "width": 1280, "minWidth": 800, "minHeight": 500,
+        "title": "Pier",
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "width": 1280,
+        "minWidth": 800,
+        "minHeight": 500,
         "height": 800
       }
     ],
@@ -35,6 +39,15 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDI5OTU3NUQyMTkyOUEwODUKUldTRm9Da1owbldWS2Y2a29HWHVhWDdJT29Jbll4WGtZWGJCRTlyamYwWk9ZUnlwWDNyMFFHWFIK",
+      "endpoints": [
+        "https://github.com/Banana-Master/pier/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

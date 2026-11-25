@@ -337,3 +337,4 @@ code { background: var(--bg3); padding: 0 5px; border-radius: 4px; font-family: 
 .alert-tbl td:first-child { color: var(--text); width: 110px; }
 .alert-tbl input { width: 64px; display: inline-block; text-align: right; }
 .ptool span { white-space: nowrap; }
+.ver { color: var(--dim, #888); font-size: 12px; margin-left: 8px; font-weight: normal; }
