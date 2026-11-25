@@ -2,6 +2,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
+import { getAlertCfg, setAlertCfg, DEFAULT_ALERTS } from "./alerts";
 import { TermGroup, routeData, routeExit, type TP } from "./terminal";
 import { startMonitor } from "./monitor";
 import { createEditor, type Ed } from "./editor";
@@ -9,10 +12,11 @@ import { createEditor, type Ed } from "./editor";
 // ───────────── 타입 ─────────────
 interface Entry { name: string; path: string; is_dir: boolean; is_symlink: boolean; size: number; mtime: number; perms: string; octal: string; owner: string }
 interface Found { path: string; is_dir: boolean; is_symlink: boolean; size: number; mtime: number }
-interface Profile { id: string; name: string; host: string; port: number; username: string; auth_type: "password" | "key"; key_path: string; remember?: boolean; group?: string; jump?: string }
+interface Profile { id: string; name: string; host: string; port: number; username: string; auth_type: "password" | "key"; key_path: string; remember?: boolean; group?: string; jump?: string; tmux?: boolean }
 interface Sess {
   sid: string; title: string; group: TermGroup;
   connArgs: Record<string, unknown>;
+  tmux: boolean; profileId: string | null; tunnelsOn: Set<string>;
   state: "ok" | "wait" | "lost"; reconnecting: boolean; closed: boolean; banner: HTMLElement | null;
   cwd: string; entries: Entry[]; selected: Set<string>; lastClicked: string | null;
   filter: string; results: Found[] | null; qEl: HTMLInputElement;
@@ -120,6 +124,14 @@ function renderTabs() {
     t.className = "tab" + (active === s.sid ? " active" : "");
     t.innerHTML = `<span class="dot ${s.state}"></span><span>${esc(s.title)}</span><span class="x">✕</span>`;
     t.onclick = () => activate(s.sid);
+    t.oncontextmenu = (e) => {
+      e.preventDefault();
+      popMenu([
+        ["🔑 키 접속으로 전환…", () => keySwitchDialog(s)],
+        ["-", () => {}],
+        ["연결 끊고 탭 닫기", () => void closeSession(s)],
+      ], e);
+    };
     $(".x", t).onclick = (e) => { e.stopPropagation(); closeSession(s); };
     s.tabEl = t;
     tabs.appendChild(t);
@@ -322,7 +334,7 @@ function renderGroups() {
 function profileCard(p: Profile): HTMLElement {
   const c = document.createElement("div");
   c.className = "card";
-  c.innerHTML = `<div class="name">${esc(p.name)}<span class="badge">${p.auth_type === "key" ? "키" : "비밀번호"}</span>${p.remember ? '<span class="badge" title="키체인에 저장됨">🔑</span>' : ""}${p.jump ? `<span class="badge" title="점프 호스트: ${esc(p.jump)}">↪ ${esc(p.jump)}</span>` : ""}</div>
+  c.innerHTML = `<div class="name">${esc(p.name)}<span class="badge">${p.auth_type === "key" ? "키" : "비밀번호"}</span>${p.remember ? '<span class="badge" title="키체인에 저장됨">🔑</span>' : ""}${p.tmux ? '<span class="badge" title="접속 시 tmux 자동 연결">tmux</span>' : ""}${p.jump ? `<span class="badge" title="점프 호스트: ${esc(p.jump)}">↪ ${esc(p.jump)}</span>` : ""}</div>
     <div class="sub">${esc(p.username)}@${esc(p.host)}:${p.port}</div>
     <div class="acts"><button class="edit" title="편집">✎</button><button class="del danger" title="삭제">🗑</button></div>`;
   c.onclick = () => (p.remember ? void quickConnect(p) : connectDialog(p));
@@ -346,7 +358,7 @@ async function quickConnect(p: Profile) {
   try {
     const args: Record<string, unknown> = { host: p.host, port: p.port, username: p.username, auth };
     if (p.jump) args.jump = await resolveJump(p.jump);
-    await openSession(p.name, args);
+    await openSession(p.name, args, { tmux: !!p.tmux, profileId: p.id });
   }
   catch (e) { toast(`연결 실패: ${errMsg(e)}`, true); connectDialog(p); }
 }
@@ -366,6 +378,7 @@ function connectDialog(p: Profile | null) {
     </div>
     <label class="check"><input id="save" type="checkbox" checked/> 접속 정보 저장</label>
     <label class="check"><input id="remember" type="checkbox"/> 비밀번호/패스프레이즈를 맥 키체인에 저장 (다음부터 클릭 한 번으로 접속)</label>
+    <label class="check"><input id="tmux" type="checkbox"/> 접속하면 tmux 에 자동 연결 (끊겨도 작업 유지 · 서버에 tmux 필요)</label>
     <div class="err" id="err"></div>
     <div class="btns"><button id="cancel">취소</button><button id="go" class="primary">연결</button></div>`);
   const g = (id: string) => $<HTMLInputElement>("#" + id, m.box);
@@ -377,7 +390,7 @@ function connectDialog(p: Profile | null) {
   auth.onchange = sync;
   if (p) {
     g("name").value = p.name; g("host").value = p.host; g("port").value = String(p.port);
-    g("user").value = p.username; g("group").value = p.group ?? ""; g("jump").value = p.jump ?? ""; auth.value = p.auth_type; g("key").value = p.key_path || "~/.ssh/id_ed25519";
+    g("user").value = p.username; g("group").value = p.group ?? ""; g("jump").value = p.jump ?? ""; g("tmux").checked = !!p.tmux; auth.value = p.auth_type; g("key").value = p.key_path || "~/.ssh/id_ed25519";
     sync();
     if (p.remember) {
       g("remember").checked = true;
@@ -400,11 +413,13 @@ function connectDialog(p: Profile | null) {
     go.disabled = true; go.textContent = "연결 중…"; err.textContent = "";
     try {
       const name = g("name").value.trim() || `${user}@${host}`;
+      let profileId: string | null = null;
       if ($<HTMLInputElement>("#save", m.box).checked) {
         const pid = p?.id ?? crypto.randomUUID();
+        profileId = pid;
         const remember = g("remember").checked;
         profiles = await invoke<Profile[]>("profile_save", {
-          profile: { id: pid, name, host, port, username: user, auth_type: type, key_path: type === "key" ? g("key").value.trim() : "", remember, group: g("group").value.trim(), jump: g("jump").value.trim() },
+          profile: { id: pid, name, host, port, username: user, auth_type: type, key_path: type === "key" ? g("key").value.trim() : "", remember, group: g("group").value.trim(), jump: g("jump").value.trim(), tmux: g("tmux").checked },
         });
         if (remember) await invoke("secret_set", { profileId: pid, value: "v:" + (type === "password" ? g("pw").value : g("pp").value) });
         else if (p?.remember) await invoke("secret_delete", { profileId: pid });
@@ -413,7 +428,7 @@ function connectDialog(p: Profile | null) {
       const args: Record<string, unknown> = { host, port, username: user, auth: authArg };
       const jumpSpec = g("jump").value.trim();
       if (jumpSpec) args.jump = await resolveJump(jumpSpec);
-      await openSession(name, args);
+      await openSession(name, args, { tmux: g("tmux").checked, profileId });
       m.close();
     } catch (e) {
       err.textContent = errMsg(e);
@@ -425,7 +440,7 @@ function connectDialog(p: Profile | null) {
 }
 
 // ───────────── 세션 열기 ─────────────
-async function openSession(title: string, args: Record<string, unknown>) {
+async function openSession(title: string, args: Record<string, unknown>, opts: { tmux?: boolean; profileId?: string | null } = {}) {
   const sid = await invoke<string>("ssh_connect", { args });
 
   const el = document.createElement("div");
@@ -439,7 +454,8 @@ async function openSession(title: string, args: Record<string, unknown>) {
         <label><input type="checkbox" class="hsz"/> 크기 숨기기</label>
         <label><input type="checkbox" class="hdt"/> 날짜 숨기기</label>
         <label><input type="checkbox" class="spm"/> 권한 보기</label>
-        <label>더블클릭 <select class="dblmode"><option value="ask">매번 묻기</option><option value="edit">에디터로 열기</option><option value="download">다운로드</option></select></label>
+        <label>더블클릭 <select class="dblmode"><option value="ask">매번 묻기</option><option value="edit">내장 에디터로 열기</option><option value="external">외부 에디터로 열기</option><option value="download">다운로드</option></select></label>
+        <label>외부 에디터 <select class="extapp"><option value="">시스템 기본 앱</option></select></label>
       </div>
       <div class="fsearch"><input class="q" placeholder="🔍 이름 검색 (입력하면 현재 폴더 필터)" spellcheck="false"/><button class="deep" title="하위 폴더까지 서버에서 검색 (Enter)">하위 검색</button></div>
       <div class="flist"></div>
@@ -448,17 +464,25 @@ async function openSession(title: string, args: Record<string, unknown>) {
     <div class="gutter"></div>
     <div class="termwrap">${SPLIT_BUTTONS}</div>
     </div>
-    <div class="statusbar"><div class="stitems"></div><button class="procbtn" title="실행 중인 프로세스 보기/종료">📋 프로세스</button></div>`;
+    <div class="statusbar"><div class="stitems"></div><button class="alertbtn" title="서버 상태 알림 설정">🔔</button><button class="logbtn" title="로그 실시간 보기">📜 로그</button><button class="dkbtn" title="Docker 컨테이너 관리">🐳 Docker</button><button class="tunbtn" title="SSH 터널 (서버 안쪽 포트를 내 맥에서 열기)">🔌 터널</button><button class="procbtn" title="실행 중인 프로세스 보기/종료">📋 프로세스</button></div>`;
   $("#stage").appendChild(el);
 
   const group = new TermGroup($(".termwrap", el), {
-    open: (cols, rows) => invoke<string>("term_open", { sessionId: sid, cols, rows }),
+    open: async (cols, rows, slot) => {
+      const id = await invoke<string>("term_open", { sessionId: sid, cols, rows });
+      if (s.tmux) {
+        // 이름이 같은 세션이 있으면 거기에 다시 붙고(재접속 시 작업 그대로), 없으면 새로 만든다
+        const n = `ssh-gui-${slot}`;
+        void invoke("term_write", { termId: id, data: ` command -v tmux >/dev/null 2>&1 && exec tmux new-session -A -s ${n} \\; set-option mouse on || echo "[tmux가 이 서버에 없어서 일반 셸로 열었어요]"\n` });
+      }
+      return id;
+    },
     onCwd: (p) => { if (s.follow && p !== s.cwd) void navigate(s, p, true); },
-    injectHook: () => s.follow,
+    injectHook: () => s.follow && !s.tmux,
     onPaneExit: (g, tp) => void onPaneExit(s, g, tp),
   });
   const s: Sess = {
-    sid, title, group, connArgs: args, state: "ok", reconnecting: false, closed: false, banner: null,
+    sid, title, group, connArgs: args, tmux: !!opts.tmux, profileId: opts.profileId ?? null, tunnelsOn: new Set(), state: "ok", reconnecting: false, closed: false, banner: null,
     cwd: "/", entries: [], selected: new Set(), lastClicked: null, follow: true, filter: "", results: null, qEl: $<HTMLInputElement>(".q", el),
     el, listEl: $(".flist", el), pathEl: $<HTMLInputElement>(".path", el), statusEl: $(".fstatus", el), tabEl: el,
   };
@@ -472,8 +496,22 @@ async function openSession(title: string, args: Record<string, unknown>) {
   wireSearch(s);
   const home = await invoke<string>("sftp_home", { sessionId: sid });
   await navigate(s, home);
-  s.stopMonitor = startMonitor(sid, $(".stitems", el));
+  const stopMon = startMonitor(sid, $(".stitems", el), (t, b) => void alertFired(s, t, b));
+  // tmux 안에서는 셸이 경로를 알려 주지 못하므로 2초마다 직접 물어본다
+  const cwdTimer = s.tmux ? setInterval(async () => {
+    if (!s.follow || s.reconnecting || s.closed) return;
+    const tp = group.focused ?? group.panes[0];
+    if (!tp) return;
+    const p = await invoke<string>("tmux_cwd", { sessionId: sid, name: `ssh-gui-${tp.slot}` }).catch(() => "");
+    if (p && p !== s.cwd) void navigate(s, p, true);
+  }, 2000) : undefined;
+  s.stopMonitor = () => { stopMon(); if (cwdTimer) clearInterval(cwdTimer); };
   $(".procbtn", el).onclick = () => openProcs(s);
+  $(".tunbtn", el).onclick = () => openTunnels(s);
+  $(".logbtn", el).onclick = () => void openLogPicker(s);
+  $(".alertbtn", el).onclick = () => openAlertSettings();
+  $(".dkbtn", el).onclick = () => openDocker(s);
+  for (const t of loadTunnels(s)) if (t.auto) void startTunnel(s, t).catch((e) => toast(`터널 “${t.name}” 시작 실패: ${errMsg(e)}`, true));
   group.focus();
 }
 
@@ -666,6 +704,441 @@ async function resolveJump(spec: string): Promise<Hop | undefined> {
   return chain;
 }
 
+// ───────────── 비밀번호 → SSH 키 접속으로 전환 ─────────────
+function keySwitchDialog(s: Sess) {
+  const auth = s.connArgs.auth as { type?: string } | undefined;
+  if (auth?.type === "key") { toast("이미 키로 접속 중인 서버예요"); return; }
+  const host = String(s.connArgs.host ?? "server");
+  const defName = host.replace(/[^A-Za-z0-9._-]/g, "_");
+  const m = modal(`
+    <h3>🔑 키 접속으로 전환</h3>
+    <div style="color:var(--dim);margin-bottom:12px;line-height:1.5">비밀번호 대신 <b>키 파일</b>로 로그인하도록 바꿔요. 내 맥에 키(열쇠)를 만들고, 서버에는 공개키(자물쇠)만 등록합니다. 지금 연결된 이 세션으로 등록하니 <b>비밀번호를 다시 입력할 필요가 없어요.</b></div>
+    <div class="field"><label>키 이름 (파일: ~/.ssh/ssh-gui_이름)</label><input id="kn" value="${esc(defName)}" spellcheck="false"/></div>
+    <div class="field grid2b"><div><label>패스프레이즈 (선택)</label><input id="kp" type="password"/></div><div><label>패스프레이즈 확인</label><input id="kp2" type="password"/></div></div>
+    <div style="color:var(--dim);font-size:12px;margin:-2px 0 8px">패스프레이즈는 키 파일 자체에 거는 비밀번호예요. 비워 두면 키 파일만으로 접속돼요.</div>
+    <label class="check" id="kr-wrap"><input id="kr" type="checkbox" checked/> 패스프레이즈를 맥 키체인에 저장 (클릭 한 번으로 접속)</label>
+    <ul class="steps" id="steps" style="display:none"></ul>
+    <div class="err" id="kerr"></div>
+    <div class="btns"><button id="x">취소</button><button id="go" class="primary">키 만들고 서버에 등록</button></div>`);
+  const g = (id: string) => $<HTMLInputElement>("#" + id, m.box);
+  $("#x", m.box).onclick = m.close;
+  const steps = $("#steps", m.box), err = $("#kerr", m.box), go = $<HTMLButtonElement>("#go", m.box);
+  const labels = ["내 맥에 키 만들기", "서버에 공개키 등록", "키로 로그인되는지 확인", "접속 정보를 키 방식으로 전환"];
+  const mark = (i: number, st: "run" | "ok" | "fail") => {
+    const li = steps.children[i] as HTMLElement;
+    li.className = st;
+    li.firstElementChild!.textContent = st === "ok" ? "✓" : st === "fail" ? "✗" : "…";
+  };
+
+  go.onclick = async () => {
+    const name = g("kn").value.trim(), pass = g("kp").value;
+    err.textContent = "";
+    if (pass !== g("kp2").value) { err.textContent = "패스프레이즈 확인이 일치하지 않아요."; return; }
+    go.disabled = true;
+    steps.style.display = "";
+    steps.innerHTML = labels.map((l) => `<li><span>·</span> ${l}</li>`).join("");
+    let i = 0;
+    try {
+      mark(0, "run");
+      const key = await invoke<{ path: string; public: string }>("key_generate", { name, passphrase: pass });
+      mark(0, "ok"); i = 1; mark(1, "run");
+      await invoke("key_install", { sessionId: s.sid, publicKey: key.public });
+      mark(1, "ok"); i = 2; mark(2, "run");
+      const keyAuth = { type: "key", path: key.path, passphrase: pass || null };
+      const testArgs: Record<string, unknown> = { ...s.connArgs, auth: keyAuth };
+      await invoke("ssh_test", { args: testArgs });
+      mark(2, "ok"); i = 3; mark(3, "run");
+
+      s.connArgs = { ...s.connArgs, auth: keyAuth }; // 자동 재접속도 키로
+      const p = profiles.find((x) => x.id === s.profileId);
+      if (p) {
+        const remember = pass ? g("kr").checked : true;
+        profiles = await invoke<Profile[]>("profile_save", { profile: { ...p, auth_type: "key", key_path: key.path, remember } });
+        if (remember) await invoke("secret_set", { profileId: p.id, value: "v:" + pass });
+        else await invoke("secret_delete", { profileId: p.id });
+        renderHome();
+      }
+      mark(3, "ok");
+      go.style.display = "none";
+      $("#x", m.box).textContent = "닫기";
+      err.style.color = "var(--ok)";
+      err.innerHTML = `완료! 이제 이 서버는 <b>${esc(key.path)}</b> 키로 접속돼요${p ? "" : " (저장된 접속이 아니라서, 다음에 접속할 때 인증 방식을 “키 파일”로 이 경로를 지정하세요)"}.<br><span style="color:var(--dim)">서버의 비밀번호 로그인을 끄는 건 키 접속이 잘 되는 걸 충분히 확인한 뒤에, 직접 하세요 (잘못하면 서버에 못 들어갈 수 있어요).</span>`;
+    } catch (e) {
+      mark(i, "fail");
+      err.style.color = "";
+      err.textContent = `${labels[i]} 실패: ${errMsg(e)}` + (i >= 1 ? "\n(이미 만든 키 파일은 ~/.ssh 에 남아 있어요)" : "");
+      go.disabled = false;
+    }
+  };
+  g("kn").focus(); g("kn").select();
+}
+
+// ───────────── SSH 터널 (포트 포워딩) ─────────────
+interface Tunnel { id: string; name: string; localPort: number; remoteHost: string; remotePort: number; auto: boolean }
+const tunnelKey = (s: Sess) => s.profileId ?? `adhoc:${s.connArgs.username}@${s.connArgs.host}`;
+function loadTunnels(s: Sess): Tunnel[] {
+  try { return JSON.parse(localStorage.getItem("tunnels") || "{}")[tunnelKey(s)] ?? []; } catch { return []; }
+}
+function saveTunnels(s: Sess, list: Tunnel[]) {
+  let all: Record<string, Tunnel[]> = {};
+  try { all = JSON.parse(localStorage.getItem("tunnels") || "{}"); } catch { /* 새로 시작 */ }
+  all[tunnelKey(s)] = list;
+  localStorage.setItem("tunnels", JSON.stringify(all));
+}
+const tunnelSig = (s: Sess, t: Tunnel) => `${s.sid}:${t.id}`;
+
+function updateTunBtn(s: Sess) {
+  const b = s.el.querySelector<HTMLElement>(".tunbtn");
+  if (b) b.textContent = s.tunnelsOn.size ? `🔌 터널 ${s.tunnelsOn.size}` : "🔌 터널";
+}
+async function startTunnel(s: Sess, t: Tunnel) {
+  await invoke("tunnel_start", { sessionId: s.sid, tunnelId: tunnelSig(s, t), localPort: t.localPort, remoteHost: t.remoteHost, remotePort: t.remotePort });
+  s.tunnelsOn.add(t.id); updateTunBtn(s);
+}
+async function stopTunnel(s: Sess, t: Tunnel) {
+  await invoke("tunnel_stop", { tunnelId: tunnelSig(s, t) });
+  s.tunnelsOn.delete(t.id); updateTunBtn(s);
+}
+
+function openTunnels(s: Sess) {
+  const presets: [string, number][] = [["직접 입력", 0], ["MySQL / MariaDB (3306)", 3306], ["PostgreSQL (5432)", 5432], ["Redis (6379)", 6379], ["MongoDB (27017)", 27017], ["웹 서비스 (8080)", 8080], ["웹 서비스 (3000)", 3000], ["Jupyter (8888)", 8888]];
+  const m = modal(`
+    <h3>🔌 SSH 터널 · ${esc(s.title)}</h3>
+    <div style="color:var(--dim);line-height:1.5;margin-bottom:10px">서버 <b>안쪽</b>에서만 열리는 DB나 관리 화면을 <b>내 맥의 localhost</b>에서 열 수 있게 임시 통로를 만들어요. 터널을 켜고 나서 내 맥 프로그램(DB 도구, 브라우저)에서 <code>localhost:내 맥 포트</code>로 접속하면 됩니다. 내 맥 안에서만 열리고 외부에는 노출되지 않아요.</div>
+    <div class="tun-list"></div>
+    <div class="tun-form">
+      <div class="field"><label>빠른 선택</label><select id="tp">${presets.map(([n, p]) => `<option value="${p}">${n}</option>`).join("")}</select></div>
+      <div class="field"><label>이름</label><input id="tn" placeholder="예: 운영 DB"/></div>
+      <div class="field grid3"><div><label>내 맥 포트</label><input id="tl" inputmode="numeric" placeholder="13306"/></div><div><label>서버 쪽 주소</label><input id="th" value="127.0.0.1" spellcheck="false"/></div><div><label>서버 쪽 포트</label><input id="tr" inputmode="numeric" placeholder="3306"/></div></div>
+      <label class="check"><input id="ta" type="checkbox"/> 이 서버에 접속하면 자동으로 켜기</label>
+    </div>
+    <div class="err" id="terr"></div>
+    <div class="btns"><button id="add" class="primary">＋ 터널 추가</button><button id="x">닫기</button></div>`);
+  const list = $(".tun-list", m.box), err = $("#terr", m.box);
+  const f = (id: string) => $<HTMLInputElement>("#" + id, m.box);
+
+  const render = () => {
+    const all = loadTunnels(s);
+    list.innerHTML = all.length ? "" : `<div class="empty" style="padding:6px 0">아직 터널이 없어요. 아래에서 추가하세요.</div>`;
+    for (const t of all) {
+      const on = s.tunnelsOn.has(t.id);
+      const r = document.createElement("div");
+      r.className = "tun-row" + (on ? " on" : "");
+      r.innerHTML = `<button class="tg" title="${on ? "끄기" : "켜기"}">${on ? "● 켜짐" : "○ 꺼짐"}</button>
+        <div class="ti"><b>${esc(t.name || "터널")}</b><span>localhost:${t.localPort} → ${esc(t.remoteHost)}:${t.remotePort}${t.auto ? " · 자동" : ""}</span></div>
+        <button class="op" title="브라우저에서 http://localhost:${t.localPort} 열기" ${on ? "" : "disabled"}>열기</button>
+        <button class="cp" title="localhost:${t.localPort} 복사">복사</button>
+        <button class="rm danger" title="삭제">🗑</button>`;
+      $(".tg", r).onclick = async () => {
+        err.textContent = "";
+        try { on ? await stopTunnel(s, t) : await startTunnel(s, t); render(); }
+        catch (e) { err.textContent = errMsg(e); }
+      };
+      $(".op", r).onclick = () => void openUrl(`http://localhost:${t.localPort}`).catch((e) => toast(errMsg(e), true));
+      $(".cp", r).onclick = () => { void navigator.clipboard.writeText(`localhost:${t.localPort}`); toast(`복사했어요: localhost:${t.localPort}`); };
+      $(".rm", r).onclick = async () => { if (on) await stopTunnel(s, t).catch(() => {}); saveTunnels(s, loadTunnels(s).filter((x) => x.id !== t.id)); render(); };
+      list.appendChild(r);
+    }
+  };
+
+  $<HTMLSelectElement>("#tp", m.box).onchange = (e) => {
+    const p = +(e.target as HTMLSelectElement).value;
+    if (!p) return;
+    f("tr").value = String(p);
+    f("tl").value = String(p >= 1024 ? p + 10000 > 65535 ? p : p + 10000 : p + 10000);
+    if (!f("tn").value) f("tn").value = presets.find((x) => x[1] === p)![0].replace(/ \(.*\)/, "");
+  };
+  $("#add", m.box).onclick = () => {
+    err.textContent = "";
+    const lp = parseInt(f("tl").value, 10), rp = parseInt(f("tr").value, 10), host = f("th").value.trim();
+    if (!(lp >= 1024 && lp <= 65535)) { err.textContent = "내 맥 포트는 1024~65535 사이로 정하세요."; return; }
+    if (!(rp >= 1 && rp <= 65535) || !host) { err.textContent = "서버 쪽 주소와 포트를 확인하세요."; return; }
+    if (loadTunnels(s).some((t) => t.localPort === lp)) { err.textContent = `내 맥 포트 ${lp} 은(는) 이미 다른 터널에서 써요.`; return; }
+    saveTunnels(s, [...loadTunnels(s), { id: crypto.randomUUID(), name: f("tn").value.trim(), localPort: lp, remoteHost: host, remotePort: rp, auto: f("ta").checked }]);
+    f("tn").value = ""; f("tl").value = ""; f("tr").value = ""; f("ta").checked = false;
+    render();
+  };
+  $("#x", m.box).onclick = m.close;
+  render();
+}
+
+// ───────────── 서버 상태 알림 ─────────────
+async function osNotify(title: string, body: string): Promise<boolean> {
+  try {
+    let ok = await isPermissionGranted();
+    if (!ok) ok = (await requestPermission()) === "granted";
+    if (ok) sendNotification({ title, body });
+    return ok;
+  } catch { return false; }
+}
+
+async function alertFired(s: Sess, title: string, body: string) {
+  toast(`⚠ ${s.title} · ${body}`, true);
+  s.el.querySelector(".alertbtn")?.classList.add("ring");
+  setTimeout(() => s.el.querySelector(".alertbtn")?.classList.remove("ring"), 15000);
+  await osNotify(`${s.title} · ${title}`, body);
+}
+
+function openAlertSettings() {
+  const c = getAlertCfg();
+  const m = modal(`
+    <h3>🔔 서버 상태 알림</h3>
+    <div style="color:var(--dim);line-height:1.5;margin-bottom:12px">연결된 서버가 아래 기준을 넘으면 <b>맥 알림</b>과 화면 알림으로 알려 드려요. 앱을 켜 두고 서버에 접속해 있을 때 동작해요. 같은 알림은 30분에 한 번만 보냅니다.</div>
+    <label class="check" style="margin-bottom:10px"><input id="ae" type="checkbox" ${c.enabled ? "checked" : ""}/> 알림 사용</label>
+    <table class="alert-tbl">
+      <tr><td>디스크 사용률</td><td><input id="ad" type="number" min="1" max="100" value="${c.disk}"/> % 이상이면</td><td></td></tr>
+      <tr><td>CPU 사용률</td><td><input id="ac" type="number" min="1" max="100" value="${c.cpu}"/> % 이상이</td><td><input id="acs" type="number" min="2" max="3600" value="${c.cpuSec}"/> 초 이상 계속되면</td></tr>
+      <tr><td>메모리 사용률</td><td><input id="am" type="number" min="1" max="100" value="${c.mem}"/> % 이상이</td><td><input id="ams" type="number" min="2" max="3600" value="${c.memSec}"/> 초 이상 계속되면</td></tr>
+      <tr><td>온도</td><td><input id="at" type="number" min="30" max="150" value="${c.temp}"/> °C 이상이면</td><td></td></tr>
+    </table>
+    <div class="err" id="aerr2"></div>
+    <div class="btns"><button id="atest">알림 테스트</button><button id="areset">기본값</button><button id="x">취소</button><button id="go" class="primary">저장</button></div>`);
+  const n = (id: string) => parseInt($<HTMLInputElement>("#" + id, m.box).value, 10);
+  $("#x", m.box).onclick = m.close;
+  $("#atest", m.box).onclick = async () => {
+    const ok = await osNotify("SSH GUI 알림 테스트", "이 알림이 보이면 설정이 잘 된 거예요.");
+    $("#aerr2", m.box).textContent = ok ? "" : "맥 알림 권한이 없어요. 시스템 설정 → 알림에서 이 앱을 허용해 주세요.";
+  };
+  $("#areset", m.box).onclick = () => {
+    const d = DEFAULT_ALERTS;
+    const set = (id: string, v: number) => ($<HTMLInputElement>("#" + id, m.box).value = String(v));
+    set("ad", d.disk); set("ac", d.cpu); set("acs", d.cpuSec); set("am", d.mem); set("ams", d.memSec); set("at", d.temp);
+  };
+  $("#go", m.box).onclick = () => {
+    const v = { disk: n("ad"), cpu: n("ac"), cpuSec: n("acs"), mem: n("am"), memSec: n("ams"), temp: n("at") };
+    if (Object.values(v).some((x) => !Number.isFinite(x))) { $("#aerr2", m.box).textContent = "모든 칸에 숫자를 입력하세요."; return; }
+    setAlertCfg({ enabled: $<HTMLInputElement>("#ae", m.box).checked, ...v });
+    m.close(); toast("알림 설정을 저장했어요");
+  };
+}
+
+// ───────────── 로그 실시간 보기 ─────────────
+const logSinks = new Map<string, { data: (b: Uint8Array) => void; end: () => void }>();
+let logSeq = 0;
+
+function openLogViewer(s: Sess, kind: "file" | "journal" | "docker", target: string) {
+  const viewId = `v${++logSeq}`;
+  const icon = kind === "file" ? "📄" : kind === "journal" ? "⚙️" : "🐳";
+  const m = modal(`
+    <h3>${icon} ${esc(target)}</h3>
+    <div class="lv-tool">
+      <input id="lq" placeholder="🔍 필터 (이 글자가 들어간 줄만 표시)" spellcheck="false"/>
+      <label><input id="lp" type="checkbox"/> 일시정지</label>
+      <label><input id="la" type="checkbox" checked/> 자동 스크롤</label>
+      <label><input id="lw" type="checkbox" checked/> 줄바꿈</label>
+      <button id="lc">지우기</button>
+      <span id="ls" class="lv-stat"></span>
+    </div>
+    <div class="logbody" tabindex="0"></div>
+    <div class="btns"><button id="x">닫기</button></div>`);
+  m.box.classList.add("xwide");
+  const body = $(".logbody", m.box), stat = $("#ls", m.box);
+  const q = $<HTMLInputElement>("#lq", m.box), pause = $<HTMLInputElement>("#lp", m.box), auto = $<HTMLInputElement>("#la", m.box), wrap = $<HTMLInputElement>("#lw", m.box);
+
+  const MAX = 5000, SHOW = 2000;
+  let lines: string[] = [], carry = "", ended = false, timer = 0, dirty = false;
+  const dec = new TextDecoder();
+  const level = (l: string) => /\b(FATAL|CRIT(ICAL)?|EMERG|ALERT|ERROR|ERR|Exception|Traceback)\b/i.test(l) ? "err" : /\bWARN(ING)?\b/i.test(l) ? "warn" : /\b(DEBUG|TRACE)\b/i.test(l) ? "dbg" : "";
+
+  const render = () => {
+    timer = 0;
+    if (pause.checked) { stat.textContent = `일시정지 중 · 전체 ${lines.length}줄`; return; }
+    const f = q.value.trim().toLowerCase();
+    const view = (f ? lines.filter((l) => l.toLowerCase().includes(f)) : lines).slice(-SHOW);
+    body.innerHTML = view.map((l) => `<div class="ll ${level(l)}">${esc(l) || "&nbsp;"}</div>`).join("");
+    if (auto.checked) body.scrollTop = body.scrollHeight;
+    stat.textContent = `${view.length}줄 표시 · 전체 ${lines.length}줄${ended ? " · 연결 종료" : ""}`;
+    dirty = false;
+  };
+  const schedule = () => { dirty = true; if (!timer) timer = window.setTimeout(render, 200); }; // 최대 초당 5번만 그린다
+
+  logSinks.set(viewId, {
+    data: (b) => {
+      const parts = (carry + dec.decode(b, { stream: true })).split(/\r?\n/);
+      carry = parts.pop() ?? "";
+      if (parts.length) { lines.push(...parts); if (lines.length > MAX) lines = lines.slice(-MAX); schedule(); }
+    },
+    end: () => { if (carry) { lines.push(carry); carry = ""; } ended = true; schedule(); },
+  });
+
+  q.oninput = render;
+  pause.onchange = () => { if (!pause.checked) render(); else render(); };
+  wrap.onchange = () => body.classList.toggle("nowrap", !wrap.checked);
+  body.onscroll = () => { auto.checked = body.scrollHeight - body.scrollTop - body.clientHeight < 40; };
+  $("#lc", m.box).onclick = () => { lines = []; carry = ""; render(); };
+  $("#x", m.box).onclick = m.close;
+
+  // 창이 닫히면(버튼/ESC/바깥 클릭 모두) 서버의 로그 프로세스를 멈추고 정리
+  const watch = setInterval(() => {
+    if (m.ov.isConnected) return;
+    clearInterval(watch); clearTimeout(timer); logSinks.delete(viewId);
+    void invoke("log_stop", { viewId });
+  }, 400);
+
+  invoke("log_start", { sessionId: s.sid, viewId, kind, target }).catch((e) => {
+    lines.push(`[로그를 열 수 없어요] ${errMsg(e)}`); ended = true; render();
+  });
+  stat.textContent = "연결 중…";
+  void dirty;
+}
+
+async function openLogPicker(s: Sess) {
+  const m = modal(`
+    <h3>📜 로그 보기 · ${esc(s.title)}</h3>
+    <div class="tabs2"><button data-t="files" class="on">로그 파일</button><button data-t="units">서비스 (systemd)</button><button data-t="docker">Docker</button><button data-t="path">직접 입력</button></div>
+    <input id="lf" placeholder="🔍 필터" spellcheck="false" style="margin-bottom:8px"/>
+    <div class="lp-list"><div class="empty" style="padding:14px 0">서버에서 목록을 찾는 중…</div></div>
+    <div class="btns"><button id="x">닫기</button></div>`);
+  m.box.classList.add("wide");
+  $("#x", m.box).onclick = m.close;
+  const list = $(".lp-list", m.box), filter = $<HTMLInputElement>("#lf", m.box);
+  let tab = "files";
+  const data = { files: [] as { size: number; mtime: number; path: string }[], units: [] as string[], docker: [] as { name: string; status: string; image: string }[] };
+  let loaded = false;
+
+  const ago = (sec: number) => { const d = Date.now() / 1000 - sec; return d < 90 ? "방금" : d < 3600 ? `${Math.round(d / 60)}분 전` : d < 86400 ? `${Math.round(d / 3600)}시간 전` : `${Math.round(d / 86400)}일 전`; };
+  const item = (icon: string, main: string, sub: string, go: () => void) => {
+    const r = document.createElement("div");
+    r.className = "lp-row";
+    r.innerHTML = `<span>${icon}</span><b title="${esc(main)}">${esc(main)}</b><em>${esc(sub)}</em>`;
+    r.onclick = go;
+    list.appendChild(r);
+  };
+  const render = () => {
+    list.innerHTML = "";
+    filter.style.display = tab === "path" ? "none" : "";
+    const f = filter.value.trim().toLowerCase();
+    if (tab === "path") {
+      list.innerHTML = `<div class="field"><label>서버의 로그 파일 전체 경로</label><input id="lpath" placeholder="예: /var/log/nginx/error.log  또는  ~/myapp/logs/app.log" spellcheck="false"/></div><div style="color:var(--dim);font-size:12px;margin-bottom:10px">앱이 직접 만든 로그는 위치가 제각각이라, 파일 패널에서 파일을 우클릭 → “로그로 실시간 보기”로 열 수도 있어요.</div><button id="lopen" class="primary">열기</button>`;
+      const open = async () => {
+        let p = $<HTMLInputElement>("#lpath", list).value.trim();
+        if (p.startsWith("~/")) p = (await invoke<string>("sftp_home", { sessionId: s.sid })) + p.slice(1);
+        if (!p.startsWith("/")) { toast("전체 경로(/ 또는 ~/ 로 시작)를 입력하세요", true); return; }
+        openLogViewer(s, "file", p);
+      };
+      $("#lopen", list).onclick = () => void open();
+      $("#lpath", list).onkeydown = (e) => { if ((e as KeyboardEvent).key === "Enter") void open(); };
+      $("#lpath", list).focus();
+      return;
+    }
+    if (!loaded) { list.innerHTML = `<div class="empty" style="padding:14px 0">서버에서 목록을 찾는 중…</div>`; return; }
+    if (tab === "files") {
+      const rows = data.files.filter((x) => x.path.toLowerCase().includes(f));
+      rows.forEach((x) => item("📄", x.path, `${fmtSize(x.size)} · ${ago(x.mtime)}`, () => openLogViewer(s, "file", x.path)));
+      if (!rows.length) list.innerHTML = `<div class="empty" style="padding:14px 0">${data.files.length ? "일치하는 파일이 없어요." : "/var/log 에서 읽을 수 있는 로그 파일을 찾지 못했어요. (권한이 필요하거나 다른 위치일 수 있어요 — “직접 입력”을 써 보세요)"}</div>`;
+    } else if (tab === "units") {
+      const rows = data.units.filter((x) => x.toLowerCase().includes(f));
+      rows.forEach((x) => item("⚙️", x, "journalctl", () => openLogViewer(s, "journal", x)));
+      if (!rows.length) list.innerHTML = `<div class="empty" style="padding:14px 0">${data.units.length ? "일치하는 서비스가 없어요." : "실행 중인 systemd 서비스를 찾지 못했어요."}</div>`;
+    } else {
+      const rows = data.docker.filter((x) => `${x.name} ${x.image}`.toLowerCase().includes(f));
+      rows.forEach((x) => item("🐳", x.name, `${x.image} · ${x.status}`, () => openLogViewer(s, "docker", x.name)));
+      if (!rows.length) list.innerHTML = `<div class="empty" style="padding:14px 0">${data.docker.length ? "일치하는 컨테이너가 없어요." : "Docker 컨테이너가 없거나 docker 를 쓸 수 없어요."}</div>`;
+    }
+  };
+  m.box.querySelectorAll<HTMLButtonElement>(".tabs2 button").forEach((b) => (b.onclick = () => {
+    tab = b.dataset.t!;
+    m.box.querySelectorAll(".tabs2 button").forEach((x) => x.classList.toggle("on", x === b));
+    render();
+  }));
+  filter.oninput = render;
+  render();
+
+  try {
+    const raw = await invoke<string>("log_candidates", { sessionId: s.sid });
+    let sec = "";
+    for (const line of raw.split("\n")) {
+      if (line.startsWith("##")) { sec = line.slice(2).trim(); continue; }
+      if (!line.trim()) continue;
+      if (sec === "FILES") { const [t, sz, ...p] = line.split("\t"); if (p.length) data.files.push({ mtime: parseFloat(t), size: parseInt(sz, 10) || 0, path: p.join("\t") }); }
+      else if (sec === "UNITS") data.units.push(line.trim());
+      else if (sec === "DOCKER") { const [name, status, image] = line.split("\t"); if (name) data.docker.push({ name, status: status ?? "", image: image ?? "" }); }
+    }
+    loaded = true; render();
+  } catch (e) { list.innerHTML = `<div class="err">${esc(errMsg(e))}</div>`; }
+  filter.focus();
+}
+
+// ───────────── Docker 패널 ─────────────
+interface DCont { id: string; name: string; image: string; state: string; status: string; ports: string; cpu: string; mem: string }
+
+function openDocker(s: Sess) {
+  const m = modal(`
+    <h3>🐳 Docker · ${esc(s.title)}</h3>
+    <div class="ptool">
+      <input id="dq" placeholder="🔍 이름 / 이미지 필터" spellcheck="false"/>
+      <label><input id="da" type="checkbox" checked/> 5초마다 새로고침</label>
+      <span id="dc" style="color:var(--dim)"></span>
+    </div>
+    <div class="ptable"><table><thead><tr><th>이름</th><th>이미지</th><th>상태</th><th>CPU</th><th>메모리</th><th>포트</th><th></th></tr></thead><tbody></tbody></table></div>
+    <div class="err" id="derr"></div>
+    <div class="btns"><button id="x">닫기</button></div>`);
+  m.box.classList.add("wide");
+  const q = $<HTMLInputElement>("#dq", m.box), auto = $<HTMLInputElement>("#da", m.box), tbody = $("tbody", m.box), derr = $("#derr", m.box);
+  let list: DCont[] = [], busy = false;
+
+  const render = () => {
+    const f = q.value.trim().toLowerCase();
+    const rows = f ? list.filter((c) => `${c.name} ${c.image}`.toLowerCase().includes(f)) : list;
+    $("#dc", m.box).textContent = `컨테이너 ${rows.length}개`;
+    tbody.innerHTML = "";
+    for (const c of rows) {
+      const run = c.state === "running";
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td><b>${esc(c.name)}</b></td><td class="cmd" title="${esc(c.image)}">${esc(c.image)}</td><td><span class="dstate ${run ? "up" : c.state === "restarting" ? "mid" : "down"}">${esc(c.state)}</span> <span style="color:var(--dim);font-size:11px">${esc(c.status)}</span></td><td>${esc(c.cpu)}</td><td>${esc(c.mem)}</td><td class="cmd" title="${esc(c.ports)}">${esc(c.ports)}</td>
+        <td class="pact">${run
+          ? `<button data-a="logs">로그</button><button data-a="shell">셸</button><button data-a="restart">재시작</button><button data-a="stop" class="danger">중지</button>`
+          : `<button data-a="logs">로그</button><button data-a="start">시작</button>`}</td>`;
+      tr.querySelectorAll<HTMLButtonElement>("button").forEach((b) => (b.onclick = () => void act(c, b.dataset.a!)));
+      tbody.appendChild(tr);
+    }
+  };
+
+  const refresh = async () => {
+    if (busy || !m.ov.isConnected) return;
+    busy = true;
+    try {
+      const raw = await invoke<string>("docker_list", { sessionId: s.sid });
+      if (raw.includes("##NODOCKER")) { derr.textContent = "이 서버에는 docker 가 설치돼 있지 않아요."; list = []; render(); return; }
+      const [psPart, statPart = ""] = raw.split("##STATS");
+      const stats = new Map<string, { cpu: string; mem: string }>();
+      for (const l of statPart.split("\n")) { const [n, cpu, mem] = l.trim().split("\t"); if (n && mem) stats.set(n, { cpu, mem: mem.split("/")[0].trim() }); }
+      const rows: DCont[] = [];
+      let bad = "";
+      for (const l of psPart.split("\n")) {
+        if (!l.trim()) continue;
+        const p = l.split("\t");
+        if (p.length >= 5) rows.push({ id: p[0], name: p[1], image: p[2], state: p[3], status: p[4], ports: p[5] ?? "", cpu: stats.get(p[1])?.cpu ?? "", mem: stats.get(p[1])?.mem ?? "" });
+        else bad += l + "\n";
+      }
+      derr.textContent = rows.length || !bad ? "" : `docker 를 실행할 수 없어요 (권한이 필요할 수 있어요 — 사용자를 docker 그룹에 추가해야 해요):\n${bad.trim()}`;
+      list = rows; render();
+    } catch (e) { derr.textContent = errMsg(e); }
+    finally { busy = false; }
+  };
+
+  const act = async (c: DCont, a: string) => {
+    if (a === "logs") { openLogViewer(s, "docker", c.name); return; }
+    if (a === "shell") {
+      const tp = s.group.focused ?? s.group.panes[0];
+      if (!tp) return;
+      void invoke("term_write", { termId: tp.termId, data: ` docker exec -it ${c.name} sh -c 'command -v bash >/dev/null 2>&1 && exec bash || exec sh'\n` });
+      m.close(); activate(s.sid); tp.term.focus();
+      return;
+    }
+    if ((a === "stop" || a === "restart") && !(await askConfirm(`${c.name} 컨테이너를 ${a === "stop" ? "중지" : "재시작"}할까요?`, c.image))) return;
+    try { toast(await invoke<string>("docker_action", { sessionId: s.sid, name: c.name, action: a }) || `${c.name}: ${a} 완료`); }
+    catch (e) { toast(`실패: ${errMsg(e)}`, true); }
+    setTimeout(() => void refresh(), 600);
+  };
+
+  q.oninput = render;
+  $("#x", m.box).onclick = m.close;
+  const timer = setInterval(() => { if (!m.ov.isConnected) clearInterval(timer); else if (auto.checked) void refresh(); }, 5000);
+  q.focus();
+  void refresh();
+}
+
 // ───────────── 프로세스 보기 / 종료 ─────────────
 interface Proc { pid: number; user: string; cpu: number; mem: number; etime: string; cmd: string }
 
@@ -844,6 +1317,13 @@ function wireFilePanel(s: Sess) {
       }
     };
   }
+  const extSel = $<HTMLSelectElement>(".extapp", el);
+  void loadExtApps().then((apps) => {
+    for (const a of apps) extSel.add(new Option(a, a));
+    extSel.value = localStorage.getItem("extApp") ?? "";
+    if (extSel.value !== (localStorage.getItem("extApp") ?? "")) extSel.value = "";
+  });
+  extSel.onchange = () => { localStorage.setItem("extApp", extSel.value); document.querySelectorAll<HTMLSelectElement>(".extapp").forEach((x) => (x.value = extSel.value)); };
   const dbl = $<HTMLSelectElement>(".dblmode", el);
   dbl.value = getOpenMode();
   dbl.onchange = () => setOpenMode(dbl.value as OpenMode);
@@ -934,6 +1414,79 @@ function renderFiles(s: Sess) {
   s.statusEl.textContent = n ? `${n}개 선택됨` : q ? `${shown.length} / ${s.entries.length}개 (필터 중)` : `${s.entries.length}개 항목`;
 }
 
+// ───────────── 권한 변경 / 압축 / 압축 풀기 ─────────────
+const ARCHIVE_RE = /\.(tar\.gz|tgz|tar\.bz2|tbz2|tar\.xz|txz|tar|zip|gz)$/i;
+const isArchive = (name: string) => ARCHIVE_RE.test(name);
+
+function permDialog(s: Sess, sel: Entry[]) {
+  const label = sel.length === 1 ? `“${sel[0].name}”` : `${sel.length}개 항목`;
+  const hasDir = sel.some((e) => e.is_dir);
+  const rows: [string, number][] = [["소유자", 6], ["그룹", 3], ["기타 사용자", 0]];
+  const m = modal(`
+    <h3>권한 변경</h3>
+    <div style="color:var(--dim);margin-bottom:10px">${esc(label)}</div>
+    <table class="perm"><thead><tr><th></th><th>읽기</th><th>쓰기</th><th>실행</th></tr></thead><tbody>
+      ${rows.map(([n, sh]) => `<tr><td>${n}</td>${[4, 2, 1].map((b) => `<td><input type="checkbox" data-bit="${b << sh}"/></td>`).join("")}</tr>`).join("")}
+    </tbody></table>
+    <div class="field" style="margin-top:12px"><label>숫자로 입력 (예: 755, 644)</label><input id="oct" maxlength="4" style="width:90px" spellcheck="false"/></div>
+    ${hasDir ? `<label class="check"><input id="rec" type="checkbox"/> 폴더 안의 모든 파일에도 적용 (하위 전체)</label>` : ""}
+    <div class="field" style="margin-top:10px"><label>소유자:그룹 변경 (선택 · 보통 root 권한 필요)</label><input id="own" placeholder="예: www-data:www-data  (비우면 변경 안 함)" spellcheck="false"/></div>
+    <div class="err" id="perr2"></div>
+    <div class="btns"><button id="x">취소</button><button id="go" class="primary">적용</button></div>`);
+  const boxes = [...m.box.querySelectorAll<HTMLInputElement>("input[data-bit]")];
+  const oct = $<HTMLInputElement>("#oct", m.box);
+  const fromBoxes = () => { oct.value = boxes.reduce((a, b) => a + (b.checked ? +b.dataset.bit! : 0), 0).toString(8).padStart(3, "0"); };
+  const fromOct = () => { const v = parseInt(oct.value || "0", 8) || 0; boxes.forEach((b) => (b.checked = (v & +b.dataset.bit!) !== 0)); };
+  boxes.forEach((b) => (b.onchange = fromBoxes));
+  oct.oninput = fromOct;
+  oct.value = sel[0].octal || (sel[0].is_dir ? "755" : "644");
+  fromOct();
+  $("#x", m.box).onclick = m.close;
+  $("#go", m.box).onclick = async () => {
+    const err = $("#perr2", m.box);
+    try {
+      toast("권한을 바꾸는 중…");
+      await invoke("remote_chmod", { sessionId: s.sid, paths: sel.map((e) => e.path), mode: oct.value.trim(), recursive: !!$<HTMLInputElement>("#rec", m.box)?.checked, owner: $<HTMLInputElement>("#own", m.box).value.trim() });
+      m.close(); toast("권한을 바꿨어요"); void navigate(s, s.cwd, true);
+    } catch (e) { err.textContent = errMsg(e); }
+  };
+  oct.focus(); oct.select();
+}
+
+function archiveDialog(s: Sess, sel: Entry[]) {
+  const base = sel.length === 1 ? sel[0].name : "archive";
+  const m = modal(`
+    <h3>압축하기</h3>
+    <div style="color:var(--dim);margin-bottom:10px">${sel.length === 1 ? esc(sel[0].name) : `${sel.length}개 항목`} → 현재 폴더(${esc(s.cwd)})에 만들어요. 서버에서 압축하므로 내 맥으로 내려받지 않아요.</div>
+    <div class="field"><label>형식</label><select id="fmt"><option value="tgz">.tar.gz (권장 · 모든 서버에서 가능)</option><option value="zip">.zip (서버에 zip 필요)</option></select></div>
+    <div class="field"><label>파일 이름</label><input id="an" spellcheck="false"/></div>
+    <div class="err" id="aerr"></div>
+    <div class="btns"><button id="x">취소</button><button id="go" class="primary">압축</button></div>`);
+  const fmt = $<HTMLSelectElement>("#fmt", m.box), an = $<HTMLInputElement>("#an", m.box);
+  const ext = () => (fmt.value === "zip" ? ".zip" : ".tar.gz");
+  const sync = () => { an.value = base + ext(); };
+  fmt.onchange = sync; sync();
+  $("#x", m.box).onclick = m.close;
+  $("#go", m.box).onclick = async () => {
+    const err = $("#aerr", m.box);
+    err.textContent = "";
+    const go = $<HTMLButtonElement>("#go", m.box);
+    go.disabled = true; go.textContent = "압축 중…";
+    try {
+      await invoke("remote_archive", { sessionId: s.sid, cwd: s.cwd, names: sel.map((e) => e.name), out: an.value.trim(), format: fmt.value });
+      m.close(); toast(`압축했어요: ${an.value.trim()}`); void navigate(s, s.cwd, true);
+    } catch (e) { err.textContent = errMsg(e); go.disabled = false; go.textContent = "압축"; }
+  };
+  an.focus(); an.setSelectionRange(0, base.length);
+}
+
+async function extractEntry(s: Sess, e: Entry) {
+  if (!(await askConfirm(`“${e.name}” 압축을 풀까요?`, `${s.cwd} 에 풀어요. 같은 이름의 파일이 있으면 덮어써집니다.`))) return;
+  toast("압축을 푸는 중…");
+  try { await invoke("remote_extract", { sessionId: s.sid, path: e.path, dest: s.cwd }); toast("압축을 풀었어요"); void navigate(s, s.cwd, true); }
+  catch (er) { toast(`압축 풀기 실패: ${errMsg(er)}`, true); }
+}
+
 // ───────────── 검색 ─────────────
 function wireSearch(s: Sess) {
   const q = s.qEl;
@@ -1004,9 +1557,14 @@ function showMenu(s: Sess, ev: MouseEvent) {
   const items: [string, () => void][] = [];
   if (sel.length) {
     if (sel.length === 1 && !sel[0].is_dir) items.push(["에디터로 열기", () => void openEditor(s, sel[0])]);
+    if (sel.length === 1 && !sel[0].is_dir) items.push(["외부 에디터로 열기", () => void openExternal(s, sel[0])]);
+    if (sel.length === 1 && !sel[0].is_dir) items.push(["로그로 실시간 보기", () => openLogViewer(s, "file", sel[0].path)]);
     items.push([`다른 서버로 복사… (${sel.length})`, () => copyToServer(s, sel.map((e) => e.path))]);
     items.push([`다운로드 (${sel.length})`, () => void download(s, sel.map((e) => e.path))]);
     if (sel.length === 1) items.push(["이름 변경", () => void renameEntry(s, sel[0])]);
+    items.push(["권한 변경…", () => permDialog(s, sel)]);
+    items.push([sel.length === 1 ? "압축하기…" : `압축하기… (${sel.length})`, () => archiveDialog(s, sel)]);
+    if (sel.length === 1 && isArchive(sel[0].name)) items.push(["압축 풀기…", () => void extractEntry(s, sel[0])]);
     items.push(["삭제", () => void removeEntries(s, sel)]);
     items.push(["-", () => {}]);
   }
@@ -1028,7 +1586,11 @@ function popMenu(items: [string, () => void][], ev: MouseEvent) {
     menu.appendChild(d);
   }
   document.body.appendChild(menu);
-  const off = () => { menu.remove(); removeEventListener("mousedown", off, true); };
+  // 메뉴 바깥을 누를 때만 닫는다. (안쪽 mousedown 에서 지워 버리면 항목의 click 이 전달되지 않는다)
+  const off = (ev: MouseEvent) => {
+    if (menu.contains(ev.target as Node)) return;
+    menu.remove(); removeEventListener("mousedown", off, true);
+  };
   setTimeout(() => addEventListener("mousedown", off, true), 0);
 }
 
@@ -1056,8 +1618,22 @@ async function removeEntries(s: Sess, list: Entry[]) {
   await navigate(s, s.cwd);
 }
 
+// ───────────── 외부 에디터 ─────────────
+let extAppsCache: string[] | null = null;
+async function loadExtApps(): Promise<string[]> {
+  return (extAppsCache ??= await invoke<string[]>("ext_apps").catch(() => []));
+}
+
+async function openExternal(s: Sess, e: Entry) {
+  const app = localStorage.getItem("extApp") ?? "";
+  try {
+    await invoke("ext_open", { sessionId: s.sid, remotePath: e.path, appName: app });
+    toast(`“${e.name}” 을(를) ${app || "기본 앱"}으로 열었어요. 저장하면 서버에 자동 반영돼요`);
+  } catch (er) { toast(errMsg(er), true); }
+}
+
 // ───────────── 파일을 열 때 선택창 ─────────────
-type OpenMode = "ask" | "edit" | "download";
+type OpenMode = "ask" | "edit" | "external" | "download";
 const getOpenMode = (): OpenMode => (localStorage.getItem("openMode") as OpenMode) || "ask";
 const setOpenMode = (m: OpenMode) => {
   localStorage.setItem("openMode", m);
@@ -1067,18 +1643,21 @@ const setOpenMode = (m: OpenMode) => {
 function openFile(s: Sess, e: Entry) {
   const mode = getOpenMode();
   if (mode === "edit") return void openEditor(s, e);
+  if (mode === "external") return void openExternal(s, e);
   if (mode === "download") return void download(s, [e.path]);
   const m = modal(`
     <h3>${esc(e.name)}</h3>
     <div style="color:var(--dim);margin-bottom:14px">${fmtSize(e.size)} · 어떻게 열까요?</div>
     <div class="choices">
-      <button id="ed" class="primary">✎ 에디터로 열기</button>
+      <button id="ed" class="primary">✎ 내장 에디터로 열기</button>
+      <button id="ex">↗ 외부 에디터로 열기 <span style="color:var(--dim);font-size:12px">(저장하면 서버에 자동 반영)</span></button>
       <button id="dl">⬇ 다운로드</button>
     </div>
     <label class="check"><input id="rem" type="checkbox"/> 이 선택을 기억하고 다음부터 묻지 않기</label>
     <div class="btns"><button id="x">취소</button></div>`);
   const remember = (v: OpenMode) => { if ($<HTMLInputElement>("#rem", m.box).checked) setOpenMode(v); };
   $("#ed", m.box).onclick = () => { remember("edit"); m.close(); void openEditor(s, e); };
+  $("#ex", m.box).onclick = () => { remember("external"); m.close(); void openExternal(s, e); };
   $("#dl", m.box).onclick = () => { remember("download"); m.close(); void download(s, [e.path]); };
   $("#x", m.box).onclick = m.close;
   $<HTMLButtonElement>("#ed", m.box).focus();
@@ -1154,6 +1733,23 @@ async function init() {
   });
   await listen<string>("term-exit", ({ payload }) => routeExit(payload));
   await listen<TransferEv>("transfer", ({ payload }) => onTransfer(payload));
+  await listen<{ id: string; data: string }>("log-data", ({ payload }) => {
+    logSinks.get(payload.id)?.data(Uint8Array.from(atob(payload.data), (c) => c.charCodeAt(0)));
+  });
+  await listen<string>("log-end", ({ payload }) => logSinks.get(payload)?.end());
+  await listen<{ id: string; name: string; kind: string; message: string }>("ext-event", async ({ payload: p }) => {
+    if (p.kind === "saved") toast(`↑ 서버에 반영했어요: ${p.name}`);
+    else if (p.kind === "error") toast(`서버에 올리지 못했어요 (${p.name}): ${p.message}`, true);
+    else if (p.kind === "conflict") {
+      const ok = await askConfirm(`서버에서 “${p.name}” 이(가) 바뀌었어요`, "에디터에서 연 뒤에 누군가(또는 어떤 프로그램이) 서버의 이 파일을 수정했어요. 지금 저장한 내용으로 덮어쓰면 그 변경이 사라집니다. 덮어쓸까요? (취소하면 이번 저장은 서버에 올리지 않아요)");
+      await invoke("ext_resolve", { id: p.id, overwrite: ok });
+      if (!ok) toast("서버에 올리지 않았어요. 필요하면 다시 저장하세요");
+    }
+  });
+  let lastTunErr = 0;
+  await listen<{ id: string; message: string }>("tunnel-error", ({ payload }) => {
+    if (Date.now() - lastTunErr > 4000) { lastTunErr = Date.now(); toast(`터널 오류: ${payload.message}`, true); }
+  });
 
   // 드래그앤드롭 업로드
   await getCurrentWebview().onDragDropEvent((e) => {

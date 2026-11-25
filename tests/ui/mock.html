@@ -1,0 +1,74 @@
+<!doctype html>
+<!-- UI 확인용: Tauri 없이 브라우저에서 화면만 볼 수 있게 가짜 백엔드를 붙인 페이지 (개발 전용, 빌드에는 포함되지 않음) -->
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <title>SSH GUI (mock)</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+    <script>
+      const cbs = new Map(); let cbId = 1; const listeners = {};
+      const b64 = (s) => btoa(unescape(encodeURIComponent(s)));
+      window.__emit = (event, payload) => (listeners[event] || []).forEach((id) => cbs.get(id)?.({ event, id, payload }));
+      let cpuT = 1000, cpuI = 800, rx = 1e6, tx = 5e5;
+      const entries = [
+        ["projects", 1, 0, "drwxr-xr-x", "755"], ["logs", 1, 0, "drwxr-x---", "750"], ["backup.tar.gz", 0, 52428800, "-rw-r--r--", "644"],
+        ["deploy.sh", 0, 1820, "-rwxr-xr-x", "755"], ["notes.md", 0, 3400, "-rw-r--r--", "644"], [".bashrc", 0, 3771, "-rw-r--r--", "644"], ["app.log", 0, 880000, "-rw-r-----", "640"],
+      ].map(([name, d, size, perms, octal]) => ({ name, path: "/home/user/" + name, is_dir: !!d, is_symlink: false, size, mtime: 1763000000, perms, octal, owner: "user:user" }));
+      const profiles = [
+        { id: "p1", name: "운영 서버", host: "prod.example.com", port: 22, username: "deploy", auth_type: "key", key_path: "~/.ssh/id_ed25519", remember: true, group: "회사", jump: "", tmux: true },
+        { id: "p2", name: "개발 서버", host: "dev.example.com", port: 22, username: "sunghoyaaa", auth_type: "password", key_path: "", remember: false, group: "회사", jump: "bastion" },
+        { id: "p3", name: "집 NAS", host: "192.168.0.20", port: 2222, username: "admin", auth_type: "password", key_path: "", remember: true, group: "", jump: "" },
+      ];
+      let logTimer;
+      async function mock(cmd, a) {
+        switch (cmd) {
+          case "default_download_dir": return "/Users/x/Downloads";
+          case "profile_list": case "profile_save": case "profile_delete": return profiles;
+          case "secret_get": return "v:pw"; case "secret_set": case "secret_delete": return null;
+          case "ssh_connect": return "s1"; case "ssh_alive": return true;
+          case "term_open": setTimeout(() => window.__emit("term-data", { id: "t1", data: b64("\x1b[32msunghoyaaa@ubuntu\x1b[0m:\x1b[34m~\x1b[0m$ ls -la\r\ntotal 48\r\ndrwxr-xr-x 5 user user 4096 Nov 24 deploy.sh\r\n\x1b[32msunghoyaaa@ubuntu\x1b[0m:\x1b[34m~\x1b[0m$ ") }), 150); return "t1";
+          case "term_write": case "term_resize": case "term_close": return null;
+          case "sftp_home": return "/home/user"; case "sftp_realpath": return a.path;
+          case "sftp_list": return entries; case "sftp_stat": return { size: 10, mtime: 1763000000 };
+          case "sftp_read_text": return "#!/bin/bash\necho hello\n";
+          case "sys_stats": cpuT += 200; cpuI += 120; rx += 40000; tx += 9000;
+            return `STAT cpu  ${cpuT - cpuI} 0 0 ${cpuI} 0 0 0 0\nMEM MemTotal:=16000000 MemAvailable:=6000000 SwapTotal:=2000000 SwapFree:=1900000 \nLOAD 0.42 0.38 0.30\nUP 360000.5\nDISK 100000000 62000000 62%\nNET ${Math.round(rx)} ${Math.round(tx)}\nTEMP 54000\nCORES 8\nPD NAME="nvme0n1" SIZE="512110190592" TYPE="disk" ROTA="0" TRAN="nvme" MODEL="Samsung SSD 980 PRO 512GB"\nPD NAME="sda" SIZE="2000398934016" TYPE="disk" ROTA="1" TRAN="sata" MODEL="WDC WD20EZAZ"\nMNT /dev/nvme0n1p2 ext4 100000000 62000000 38000000 62% /\nMNT /dev/sda1 ext4 1900000000 400000000 1400000000 22% /data\n`;
+          case "sys_procs": return "  1 root 0.1 0.2 12:10:01 /sbin/init\n 2210 www-data 61.5 3.2 02:11 nginx: worker process\n 3301 postgres 12.0 8.4 3-04:00:00 postgres: main\n 4410 deploy 0.3 1.1 00:20 node /srv/app/server.js --port 3000\n";
+          case "docker_list": return "a1b2\tweb\tnginx:1.25\trunning\tUp 3 days\t0.0.0.0:80->80/tcp\nc3d4\tdb\tpostgres:16\trunning\tUp 3 days\t5432/tcp\ne5f6\tworker\tmyapp:latest\texited\tExited (1) 2 hours ago\t\n##STATS\nweb\t1.20%\t24MiB / 16GiB\ndb\t12.00%\t310MiB / 16GiB\n";
+          case "docker_action": return "web";
+          case "log_candidates": return "##FILES\n1763000000.0\t880000\t/var/log/nginx/error.log\n1762990000.0\t52000\t/var/log/syslog\n1762000000.0\t9000\t/var/log/auth.log\n##UNITS\nnginx.service\nssh.service\npostgresql.service\n##DOCKER\nweb\tUp 3 days\tnginx:1.25\ndb\tUp 3 days\tpostgres:16\n##END\n";
+          case "log_start": { let n = 0; clearInterval(logTimer); logTimer = setInterval(() => { n++; const lv = n % 7 === 0 ? "ERROR connection refused" : n % 4 === 0 ? "WARN slow query 1200ms" : "INFO request handled ok"; window.__emit("log-data", { id: a.viewId, data: b64(`2026-11-25T10:00:${String(n % 60).padStart(2, "0")} ${lv}\r\n`) }); }, 150); return null; }
+          case "log_stop": clearInterval(logTimer); return null;
+          case "tunnel_start": case "tunnel_stop": return null;
+          case "key_generate": await new Promise((r) => setTimeout(r, 400)); return { path: "~/.ssh/ssh-gui_" + a.name, public: "ssh-ed25519 AAAAC3Nza-mock ssh-gui@" + a.name };
+          case "key_install": await new Promise((r) => setTimeout(r, 400)); return "";
+          case "ssh_test": await new Promise((r) => setTimeout(r, 400)); return null;
+          case "ext_apps": return ["Visual Studio Code", "Zed", "TextEdit"];
+          case "ssh_config_hosts": return [{ alias: "bastion", hostname: "203.0.113.10", user: "ec2-user", port: 22, identity_file: "~/.ssh/aws.pem", proxy_jump: "" }, { alias: "web1", hostname: "10.0.0.5", user: "deploy", port: 22, identity_file: "", proxy_jump: "bastion" }];
+          default: return null;
+        }
+      }
+      window.__TAURI_INTERNALS__ = {
+        metadata: { currentWindow: { label: "main" }, currentWebview: { label: "main", windowLabel: "main" } },
+        transformCallback(cb) { const id = cbId++; cbs.set(id, cb); return id; },
+        unregisterCallback(id) { cbs.delete(id); },
+        convertFileSrc: (p) => p,
+        async invoke(cmd, args) {
+          if (cmd === "plugin:event|listen") { (listeners[args.event] ||= []).push(args.handler); return args.handler; }
+          if (cmd.startsWith("plugin:event|")) return null;
+          if (cmd.startsWith("plugin:")) return null;
+          return mock(cmd, args || {});
+        },
+      };
+    </script>
+    <script type="module" src="/src/main.ts"></script>
+  </head>
+  <body>
+    <div id="app">
+      <div id="tabbar"><div id="tabs"></div><button id="new-tab" title="새 접속">＋</button><button id="new-local" title="로컬 터미널">💻</button><div id="drag-fill"></div></div>
+      <div id="stage"><section id="home"></section></div>
+      <div id="transfers"></div>
+    </div>
+    <div id="toasts"></div>
+  </body>
+</html>

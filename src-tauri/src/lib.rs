@@ -2,9 +2,11 @@ mod ssh;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    ssh::cleanup_ext_cache();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(ssh::AppState::default())
         .invoke_handler(tauri::generate_handler![
             ssh::ssh_connect,
@@ -37,6 +39,23 @@ pub fn run() {
             ssh::sys_procs,
             ssh::proc_kill,
             ssh::sftp_copy,
+            ssh::tmux_cwd,
+            ssh::remote_chmod,
+            ssh::remote_archive,
+            ssh::remote_extract,
+            ssh::key_generate,
+            ssh::key_install,
+            ssh::ssh_test,
+            ssh::tunnel_start,
+            ssh::tunnel_stop,
+            ssh::log_candidates,
+            ssh::log_start,
+            ssh::log_stop,
+            ssh::docker_list,
+            ssh::docker_action,
+            ssh::ext_apps,
+            ssh::ext_open,
+            ssh::ext_resolve,
             ssh::ssh_config_hosts,
             ssh::sftp_read_text,
             ssh::sftp_write_text,
