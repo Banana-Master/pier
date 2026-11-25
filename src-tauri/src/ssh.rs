@@ -1526,6 +1526,75 @@ Match host foo
         assert_eq!(w.identity_file, "~/.ssh/web_key"); // 자기 설정이 기본값보다 우선
     }
 
+    /// 압축 스크립트를 이 맥의 sh 로 실행해서 결과(__OK__ 여부, 출력)를 돌려준다
+    fn run_local(script: &str) -> (bool, String) {
+        let mut child = std::process::Command::new("sh").arg("-s")
+            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+        use std::io::Write as _;
+        child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+        let o = child.wait_with_output().unwrap();
+        let text = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        (text.contains("__OK__"), text)
+    }
+
+    #[test]
+    fn archive_keeps_or_deletes_originals_safely() {
+        let tmp = std::env::temp_dir().join(format!("sshgui-arch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let work = tmp.join("work dir");
+        std::fs::create_dir_all(work.join("sub")).unwrap();
+        std::fs::create_dir_all(tmp.join("out")).unwrap();
+        std::fs::write(work.join("a b.txt"), "data").unwrap();
+        std::fs::write(work.join("sub/c.txt"), "c").unwrap();
+        let cwd = work.to_string_lossy().to_string();
+        let names = vec!["a b.txt".to_string(), "sub".to_string()];
+
+        // 기본: 원본 유지, 현재 폴더에 생성
+        let sc = archive_script(&cwd, &names, "k.tar.gz", "", "tgz", false).unwrap();
+        assert!(run_local(&sc).0);
+        assert!(work.join("k.tar.gz").exists() && work.join("a b.txt").exists() && work.join("sub/c.txt").exists());
+
+        // 같은 이름이 있으면 거부(덮어쓰지 않음)
+        assert!(!run_local(&sc).0);
+
+        // 다른 폴더에 저장 + 원본 삭제: 압축본이 만들어지고 검증된 뒤에만 원본이 사라져야 함
+        let outd = tmp.join("out").to_string_lossy().to_string();
+        let sc = archive_script(&cwd, &names, "m.tar.gz", &outd, "tgz", true).unwrap();
+        let (ok, text) = run_local(&sc);
+        assert!(ok, "{text}");
+        assert!(tmp.join("out/m.tar.gz").exists(), "지정한 위치에 만들어져야 함");
+        assert!(!work.join("a b.txt").exists() && !work.join("sub").exists(), "원본은 삭제돼야 함");
+        assert!(work.join("k.tar.gz").exists(), "대상이 아닌 파일은 그대로");
+        // 압축본 안에 내용이 실제로 들어 있는지
+        let ls = std::process::Command::new("tar").args(["-tzf"]).arg(tmp.join("out/m.tar.gz")).output().unwrap();
+        let listing = String::from_utf8_lossy(&ls.stdout).to_string();
+        assert!(listing.contains("a b.txt") && listing.contains("sub/c.txt"), "{listing}");
+
+        // 압축 도중 실패하면 원본을 절대 지우지 않음 (대상이 없는 이름)
+        std::fs::write(work.join("keep.txt"), "keep").unwrap();
+        let sc = archive_script(&cwd, &["keep.txt".to_string(), "missing.txt".to_string()], "bad.tar.gz", "", "tgz", true).unwrap();
+        let (ok, _) = run_local(&sc);
+        assert!(!ok);
+        assert!(work.join("keep.txt").exists(), "실패 시 원본은 그대로여야 함");
+        assert!(!work.join("bad.tar.gz").exists(), "실패한 압축 파일은 남기지 않아야 함");
+
+        // 위험한 입력은 스크립트 생성 단계에서 거부
+        assert!(archive_script(&cwd, &["..".to_string()], "x.tar.gz", "", "tgz", true).is_err());
+        assert!(archive_script(&cwd, &[".".to_string()], "x.tar.gz", "", "tgz", true).is_err());
+        assert!(archive_script(&cwd, &["a/b".to_string()], "x.tar.gz", "", "tgz", false).is_err());
+        assert!(archive_script(&cwd, &["x".to_string()], "../x.tar.gz", "", "tgz", false).is_err());
+        assert!(archive_script("/", &["etc".to_string()], "x.tar.gz", "", "tgz", true).is_err(), "루트에서 원본 삭제 금지");
+        let inside = format!("{cwd}/sub/inner");
+        assert!(archive_script(&cwd, &["sub".to_string()], "x.tar.gz", &inside, "tgz", false).is_err(), "압축 대상 폴더 안에는 저장 금지");
+        assert!(archive_script("relative", &["x".to_string()], "x.tar.gz", "", "tgz", false).is_err());
+        // 이름에 따옴표/공백/셸 특수문자가 있어도 안전
+        std::fs::write(work.join("it's $(x); y.txt"), "q").unwrap();
+        let sc = archive_script(&cwd, &["it's $(x); y.txt".to_string()], "q.tar.gz", "", "tgz", true).unwrap();
+        assert!(run_local(&sc).0);
+        assert!(!work.join("it's $(x); y.txt").exists() && work.join("q.tar.gz").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     // HOME 환경변수를 바꾸는 테스트끼리 동시에 돌지 않게 한다
     static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -1822,7 +1891,65 @@ pub async fn remote_chmod(
     script_ok(run_sh(&s, &format!("{{ {cmd}; }} 2>&1 && echo __OK__\n"), 120).await?)
 }
 
-/// `cwd` 안의 `names` 를 하나의 압축 파일로 묶는다. format: "tgz" | "zip"
+/// 압축 스크립트를 만든다. 원본은 기본적으로 그대로 두고, `delete_source` 면 압축본을 검증한 뒤에만 원본을 지운다.
+/// `out_dir` 이 비어 있으면 `cwd` 에 만든다. format: "tgz" | "zip"
+fn archive_script(cwd: &str, names: &[String], out: &str, out_dir: &str, format: &str, delete_source: bool) -> R<String> {
+    if out.is_empty() || out.contains('/') || out.starts_with('-') {
+        return Err("압축 파일 이름이 올바르지 않아요".into());
+    }
+    if names.is_empty() || names.iter().any(|n| n.is_empty() || n.contains('/') || n == "." || n == "..") {
+        return Err("대상이 올바르지 않아요".into());
+    }
+    if !cwd.starts_with('/') || (!out_dir.is_empty() && !out_dir.starts_with('/')) {
+        return Err("경로는 / 로 시작하는 전체 경로여야 해요".into());
+    }
+    let base = cwd.trim_end_matches('/');
+    let dest_dir = if out_dir.is_empty() { base.to_string() } else { out_dir.trim_end_matches('/').to_string() };
+    // 압축 파일을 압축 대상 폴더 안에 만들면 자기 자신을 다시 담게 되므로 막는다
+    for n in names {
+        let src = format!("{base}/{n}");
+        if dest_dir == src || dest_dir.starts_with(&format!("{src}/")) {
+            return Err(format!("저장 위치가 압축할 폴더 “{n}” 안이에요. 다른 위치를 고르세요"));
+        }
+    }
+    if delete_source && base.is_empty() {
+        return Err("루트(/) 폴더에서는 원본 삭제를 쓸 수 없어요".into());
+    }
+    let target = format!("{}/{}", if dest_dir.is_empty() { "" } else { &dest_dir }, out);
+    let (t, list) = (sh_quote(&target), names.iter().map(|n| sh_quote(n)).collect::<Vec<_>>().join(" "));
+    let (make, verify) = match format {
+        "tgz" => (format!("tar -czf {t} -- {list}"), format!("tar -tzf {t} >/dev/null")),
+        "zip" => (
+            format!("command -v zip >/dev/null 2>&1 || {{ echo '서버에 zip 이 설치돼 있지 않아요 (tar.gz 를 쓰세요)'; exit 1; }}; zip -qr {t} -- {list}"),
+            format!("[ -s {t} ]"),
+        ),
+        _ => return Err("지원하지 않는 형식이에요".into()),
+    };
+    let mut script = format!(
+        "cd {} || exit 1\n[ -d {} ] || {{ echo '저장 위치 폴더가 없어요'; exit 1; }}\n[ -e {t} ] && {{ echo '같은 이름의 파일이 이미 있어요'; exit 1; }}\n",
+        sh_quote(base.if_empty("/")),
+        sh_quote(dest_dir.as_str().if_empty("/")),
+    );
+    script.push_str(&format!("{{ {make}; }} 2>&1 || {{ rm -f {t}; exit 1; }}\n"));
+    // 압축본이 읽히는지 확인하기 전에는 절대 원본을 지우지 않는다
+    script.push_str(&format!("{{ {verify}; }} 2>&1 || {{ echo '압축 파일 검증에 실패해서 중단했어요 (원본은 그대로예요)'; exit 1; }}\n"));
+    if delete_source {
+        script.push_str(&format!("rm -rf -- {list} 2>&1 || {{ echo '압축은 됐지만 원본 일부를 지우지 못했어요'; exit 1; }}\n"));
+    }
+    script.push_str("echo __OK__\n");
+    Ok(script)
+}
+
+trait IfEmpty {
+    fn if_empty<'a>(&'a self, fallback: &'a str) -> &'a str;
+}
+impl IfEmpty for str {
+    fn if_empty<'a>(&'a self, fallback: &'a str) -> &'a str {
+        if self.is_empty() { fallback } else { self }
+    }
+}
+
+/// `cwd` 안의 `names` 를 하나의 압축 파일로 묶는다.
 #[tauri::command]
 pub async fn remote_archive(
     state: State<'_, AppState>,
@@ -1830,26 +1957,12 @@ pub async fn remote_archive(
     cwd: String,
     names: Vec<String>,
     out: String,
+    out_dir: String,
     format: String,
+    delete_source: bool,
 ) -> R<String> {
-    if out.is_empty() || out.contains('/') || out.starts_with('-') {
-        return Err("압축 파일 이름이 올바르지 않아요".into());
-    }
-    if names.is_empty() || names.iter().any(|n| n.contains('/')) {
-        return Err("대상이 올바르지 않아요".into());
-    }
+    let script = archive_script(&cwd, &names, &out, &out_dir, &format, delete_source)?;
     let s = state.session(&session_id).await?;
-    let list = names.iter().map(|n| sh_quote(n)).collect::<Vec<_>>().join(" ");
-    let o = sh_quote(&out);
-    let make = match format.as_str() {
-        "tgz" => format!("tar -czf {o} -- {list}"),
-        "zip" => format!("command -v zip >/dev/null 2>&1 || {{ echo '서버에 zip 이 설치돼 있지 않아요 (tar.gz 를 쓰세요)'; exit 1; }}; zip -qr {o} -- {list}"),
-        _ => return Err("지원하지 않는 형식이에요".into()),
-    };
-    let script = format!(
-        "cd {} || exit 1\n[ -e {o} ] && {{ echo '같은 이름의 파일이 이미 있어요'; exit 1; }}\n{{ {make}; }} 2>&1 && echo __OK__\n",
-        sh_quote(&cwd)
-    );
     script_ok(run_sh(&s, &script, 900).await?)
 }
 

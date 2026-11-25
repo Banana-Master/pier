@@ -1457,25 +1457,33 @@ function archiveDialog(s: Sess, sel: Entry[]) {
   const base = sel.length === 1 ? sel[0].name : "archive";
   const m = modal(`
     <h3>압축하기</h3>
-    <div style="color:var(--dim);margin-bottom:10px">${sel.length === 1 ? esc(sel[0].name) : `${sel.length}개 항목`} → 현재 폴더(${esc(s.cwd)})에 만들어요. 서버에서 압축하므로 내 맥으로 내려받지 않아요.</div>
+    <div style="color:var(--dim);margin-bottom:10px">${sel.length === 1 ? esc(sel[0].name) : `${sel.length}개 항목`}을(를) 서버에서 압축해요. 내 맥으로 내려받지 않아요.</div>
     <div class="field"><label>형식</label><select id="fmt"><option value="tgz">.tar.gz (권장 · 모든 서버에서 가능)</option><option value="zip">.zip (서버에 zip 필요)</option></select></div>
     <div class="field"><label>파일 이름</label><input id="an" spellcheck="false"/></div>
+    <div class="field"><label>저장 위치 (서버 폴더)</label><input id="ad" spellcheck="false" value="${esc(s.cwd)}"/></div>
+    <label class="check"><input id="ads" type="checkbox"/> 압축 후 <b>원본 삭제</b> (이동) <span style="color:var(--dim)">— 기본은 원본을 그대로 둬요</span></label>
+    <div id="adw" style="display:none;color:#f0b429;font-size:12px;margin:4px 0 0 22px">압축본이 정상인지 확인한 뒤에만 원본을 지워요. 지운 원본은 휴지통 없이 바로 사라집니다.</div>
     <div class="err" id="aerr"></div>
     <div class="btns"><button id="x">취소</button><button id="go" class="primary">압축</button></div>`);
   const fmt = $<HTMLSelectElement>("#fmt", m.box), an = $<HTMLInputElement>("#an", m.box);
   const ext = () => (fmt.value === "zip" ? ".zip" : ".tar.gz");
   const sync = () => { an.value = base + ext(); };
   fmt.onchange = sync; sync();
+  const del = $<HTMLInputElement>("#ads", m.box);
+  del.onchange = () => { $("#adw", m.box).style.display = del.checked ? "" : "none"; $("#go", m.box).textContent = del.checked ? "압축하고 원본 삭제" : "압축"; };
   $("#x", m.box).onclick = m.close;
   $("#go", m.box).onclick = async () => {
     const err = $("#aerr", m.box);
     err.textContent = "";
+    const label = del.checked ? "압축하고 원본 삭제" : "압축";
+    if (del.checked && !(await askConfirm(`원본 ${sel.length === 1 ? `“${sel[0].name}”` : `${sel.length}개 항목`}을(를) 삭제할까요?`, "압축본이 정상인 걸 확인한 뒤에 원본을 지워요. 지운 원본은 되돌릴 수 없어요."))) return;
     const go = $<HTMLButtonElement>("#go", m.box);
     go.disabled = true; go.textContent = "압축 중…";
     try {
-      await invoke("remote_archive", { sessionId: s.sid, cwd: s.cwd, names: sel.map((e) => e.name), out: an.value.trim(), format: fmt.value });
-      m.close(); toast(`압축했어요: ${an.value.trim()}`); void navigate(s, s.cwd, true);
-    } catch (e) { err.textContent = errMsg(e); go.disabled = false; go.textContent = "압축"; }
+      const dir = $<HTMLInputElement>("#ad", m.box).value.trim();
+      await invoke("remote_archive", { sessionId: s.sid, cwd: s.cwd, names: sel.map((e) => e.name), out: an.value.trim(), outDir: dir === s.cwd ? "" : dir, format: fmt.value, deleteSource: del.checked });
+      m.close(); toast(`압축했어요: ${an.value.trim()}${del.checked ? " (원본 삭제됨)" : ""}`); void navigate(s, s.cwd, true);
+    } catch (e) { err.textContent = errMsg(e); go.disabled = false; go.textContent = label; }
   };
   an.focus(); an.setSelectionRange(0, base.length);
 }
